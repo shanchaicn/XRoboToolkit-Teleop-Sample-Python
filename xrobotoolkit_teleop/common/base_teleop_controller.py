@@ -60,6 +60,8 @@ class BaseTeleopController(abc.ABC):
         self.effector_task = {}
         self.effector_control_mode = {}  # Store control mode for each end effector
         self.active = {}
+        self.grip_threshold = 0.9  # Default activation threshold for control trigger, subclasses can override
+        self.grip_release_threshold = self.grip_threshold
         self.gripper_pos_target = {}
 
         # Motion tracker support
@@ -142,9 +144,9 @@ class BaseTeleopController(abc.ABC):
             # Get control mode (default to "pose" for backward compatibility)
             control_mode = config.get("control_mode", "pose")
             self.effector_control_mode[name] = control_mode
-            
+
             ee_xyz, ee_quat = self._get_link_pose(config["link_name"])
-            
+
             if control_mode == "position":
                 # Position-only control
                 self.effector_task[name] = self.solver.add_position_task(config["link_name"], ee_xyz)
@@ -155,7 +157,7 @@ class BaseTeleopController(abc.ABC):
                 ee_target[:3, 3] = ee_xyz
                 self.effector_task[name] = self.solver.add_frame_task(config["link_name"], ee_target)
                 print(f"Created pose task for {name} -> {config['link_name']}")
-            
+
             self.effector_task[name].configure(name, "soft", 1.0)
             manipulability = self.solver.add_manipulability_task(config["link_name"], "both", 1.0)
             manipulability.configure("manipulability", "soft", 1e-2)
@@ -187,7 +189,11 @@ class BaseTeleopController(abc.ABC):
 
         for src_name, config in self.manipulator_config.items():
             xr_grip_val = self.xr_client.get_key_value_by_name(config["control_trigger"])
-            self.active[src_name] = xr_grip_val > 0.9
+            was_active = self.active.get(src_name, False)
+            if was_active:
+                self.active[src_name] = xr_grip_val > self.grip_release_threshold
+            else:
+                self.active[src_name] = xr_grip_val > self.grip_threshold
 
             if self.active[src_name]:
                 if self.ref_ee_xyz[src_name] is None:
@@ -196,7 +202,7 @@ class BaseTeleopController(abc.ABC):
 
                 xr_pose = self.xr_client.get_pose_by_name(config["pose_source"])
                 delta_xyz, delta_rot = self._process_xr_pose(xr_pose, src_name)
-                
+
                 if self.effector_control_mode[src_name] == "position":
                     # Position-only control: only apply position delta
                     target_xyz = self.ref_ee_xyz[src_name] + delta_xyz
@@ -216,7 +222,9 @@ class BaseTeleopController(abc.ABC):
                 if self.ref_ee_xyz[src_name] is not None:
                     print(f"{src_name} is deactivated.")
                     self.ref_ee_xyz[src_name] = None
+                    self.ref_ee_quat[src_name] = None
                     self.ref_controller_xyz[src_name] = None
+                    self.ref_controller_quat[src_name] = None
 
         # Process motion tracker data
         self._update_motion_tracker_tasks()
@@ -278,7 +286,7 @@ class BaseTeleopController(abc.ABC):
         self.placo_vis.display(self.placo_robot.state.q)
         for name, config in self.manipulator_config.items():
             robot_frame_viz(self.placo_robot, config["link_name"])
-            
+
             # Show appropriate visualization based on control mode
             if self.effector_control_mode[name] == "position":
                 # Create a frame matrix for position-only visualization
@@ -302,7 +310,7 @@ class BaseTeleopController(abc.ABC):
         self.placo_vis.display(self.placo_robot.state.q)
         for name, config in self.manipulator_config.items():
             robot_frame_viz(self.placo_robot, config["link_name"])
-            
+
             # Show appropriate visualization based on control mode
             if self.effector_control_mode[name] == "position":
                 # Create a frame matrix for position-only visualization
@@ -330,7 +338,7 @@ class BaseTeleopController(abc.ABC):
         for name, config in self.manipulator_config.items():
             # Get current link pose
             ee_xyz, ee_quat = self._get_link_pose(config["link_name"])
-            
+
             # Update the corresponding placo task
             if self.effector_control_mode[name] == "position":
                 # Position-only control: update target position
@@ -340,7 +348,7 @@ class BaseTeleopController(abc.ABC):
                 ee_target = tf.quaternion_matrix(ee_quat)
                 ee_target[:3, 3] = ee_xyz
                 self.effector_task[name].T_world_frame = ee_target
-            
+
             print(f"Synced {name} end effector pose to placo task: {config['link_name']}")
 
     def _update_gripper_target(self):
