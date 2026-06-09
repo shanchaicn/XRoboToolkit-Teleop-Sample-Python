@@ -11,8 +11,10 @@ Usage:
     If no file path is provided, it will analyze the first .pkl file found in logs/.
 """
 
+import argparse
 import pickle
 import sys
+import types
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -34,6 +36,28 @@ class TeleopDataAnalyzer:
         self.pkl_file_path = Path(pkl_file_path)
         self.data: Optional[List[Dict]] = None
         self.analysis_results: Dict[str, Any] = {}
+
+    @staticmethod
+    def _install_pyrealsense2_pickle_stub():
+        """Allow unpickling logs on machines/envs without pyrealsense2."""
+
+        class DummyFormat:
+            def __new__(cls, *args, **kwargs):
+                return object.__new__(cls)
+
+            def __setstate__(self, state):
+                self.state = state
+
+        if "pyrealsense2.pyrealsense2" in sys.modules:
+            return
+
+        pkg = types.ModuleType("pyrealsense2")
+        pkg.__path__ = []
+        sub = types.ModuleType("pyrealsense2.pyrealsense2")
+        sub.format = DummyFormat
+        pkg.pyrealsense2 = sub
+        sys.modules.setdefault("pyrealsense2", pkg)
+        sys.modules.setdefault("pyrealsense2.pyrealsense2", sub)
     
     def load_data(self) -> bool:
         """
@@ -52,6 +76,20 @@ class TeleopDataAnalyzer:
             print(f"✅ Successfully loaded {len(self.data)} data entries")
             return True
             
+        except ModuleNotFoundError as e:
+            if "pyrealsense2" not in str(e):
+                print(f"❌ Error loading pickle file: {e}")
+                return False
+            try:
+                print("ℹ️ pyrealsense2 not found, using pickle compatibility stub...")
+                self._install_pyrealsense2_pickle_stub()
+                with open(self.pkl_file_path, "rb") as f:
+                    self.data = pickle.load(f)
+                print(f"✅ Successfully loaded {len(self.data)} data entries")
+                return True
+            except Exception as retry_error:
+                print(f"❌ Error loading pickle file after stub install: {retry_error}")
+                return False
         except Exception as e:
             print(f"❌ Error loading pickle file: {e}")
             return False
@@ -460,7 +498,7 @@ class TeleopDataAnalyzer:
             else:
                 print(f"   ❌ {category}: Not found")
     
-    def run_full_analysis(self):
+    def run_full_analysis(self, show_images: bool = False, ask_before_display: bool = True):
         """Run the complete analysis pipeline."""
         print("🤖 XRoboToolkit Teleop Data Log Analyzer")
         print("="*80)
@@ -476,9 +514,12 @@ class TeleopDataAnalyzer:
         self.generate_summary_report()
         
         # Display camera images from sample entries
-        if 'image' in self.data[0]:
+        if "image" in self.data[0] and (show_images or ask_before_display):
             print("\n" + "="*80)
-            user_input = input("Display camera images from sample entries (first, middle, last)? (y/n): ").strip().lower()
+            if show_images and not ask_before_display:
+                user_input = "y"
+            else:
+                user_input = input("Display camera images from sample entries (first, middle, last)? (y/n): ").strip().lower()
             if user_input in ['y', 'yes']:
                 # Use same logic as show_sample_data for entry selection
                 if len(self.data) == 1:
@@ -516,9 +557,19 @@ def find_first_pkl_file(logs_dir: str = "logs") -> Optional[str]:
 
 def main():
     """Main function to run the analysis."""
+    parser = argparse.ArgumentParser(description="Analyze and optionally visualize teleop pkl logs.")
+    parser.add_argument("pkl_file_path", nargs="?", help="Path to a pickle file. If omitted, use first pkl under logs/.")
+    parser.add_argument("--show-images", action="store_true", help="Display camera images from first/middle/last entries.")
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Do not ask interactive questions. Use with --show-images for direct visualization.",
+    )
+    args = parser.parse_args()
+
     # Determine which file to analyze
-    if len(sys.argv) > 1:
-        pkl_file_path = sys.argv[1]
+    if args.pkl_file_path:
+        pkl_file_path = args.pkl_file_path
     else:
         pkl_file_path = find_first_pkl_file()
         if not pkl_file_path:
@@ -531,7 +582,10 @@ def main():
     
     # Run analysis
     analyzer = TeleopDataAnalyzer(pkl_file_path)
-    success = analyzer.run_full_analysis()
+    success = analyzer.run_full_analysis(
+        show_images=args.show_images,
+        ask_before_display=not args.no_prompt,
+    )
     
     return 0 if success else 1
 

@@ -9,12 +9,17 @@ Usage:
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --jog-any-c-orientation-only
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --jog-any-c-interrupt on
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode placo_ik --zone-ratio 0.05
+    # A: {Stop} + home; axis click toggles gripper stream; axisX/Y -> distance in [0, gripper_max_d] (default 12)
     python scripts/hardware/teleop_tb6r5_hardware.py --scale-factor 2.0 --cartesian-max-step-pos-m 0.05
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --cartesian-vel 1.0 --cartesian-acc 1.0 --cartesian-dec 1.0
     python scripts/hardware/teleop_tb6r5_hardware.py --jog-any-c-preview
     python scripts/visualization/vis_jog_any_c_robottarget.py
     python scripts/hardware/teleop_tb6r5_hardware.py --enable-log-data --log-dir logs/tb6r5
     python scripts/hardware/teleop_tb6r5_hardware.py --enable-log-data --enable-camera
+    # Save directly as LeRobot v3 (no .pkl); B=episode, A=discard, same as official lerobot_record
+    python scripts/hardware/teleop_tb6r5_hardware.py --enable-log-data --enable-camera \
+        --enable-lerobot-log --lerobot-root data/lerobot/tb6r5_live --lerobot-repo-id local/tb6r5_live \
+        --lerobot-overwrite
 """
 
 import tyro
@@ -39,6 +44,10 @@ from xrobotoolkit_teleop.hardware.tb6r5_teleop_controller import (
     DEFAULT_JOG_ANY_C_POSITION_ONLY,
     DEFAULT_JOG_ANY_C_ORIENTATION_ONLY,
     DEFAULT_JOG_ANY_C_INTERRUPT,
+    DEFAULT_SAFE_TCP_Z_MIN_M,
+    DEFAULT_SAFE_TCP_Z_MAX_M,
+    DEFAULT_PRINT_IK_TCP_POSE,
+    DEFAULT_PRINT_IK_TCP_POSE_INTERVAL_S,
     DEFAULT_ZONE_RATIO,
     DEFAULT_LOG_JOINT_COUNT,
     DEFAULT_GRIPPER_TRIGGER_NAME,
@@ -46,6 +55,10 @@ from xrobotoolkit_teleop.hardware.tb6r5_teleop_controller import (
     DEFAULT_GRIPPER_OPEN_CMD,
     DEFAULT_GRIPPER_CLOSED_CMD,
     DEFAULT_GRIPPER_OBSERVATION,
+    DEFAULT_JOYSTICK_CONTROLLER,
+    DEFAULT_JOYSTICK_AXIS_CLICK,
+    DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+    DEFAULT_GRIPPER_MAX_D,
     DEFAULT_REALSENSE_SERIAL_DICT,
     JogAnyCInterruptMode,
 )
@@ -70,9 +83,23 @@ def main(
     joint_vel: float = DEFAULT_JOG_ANY_JOINT_VEL,
     joint_acc: float = DEFAULT_JOG_ANY_JOINT_ACC,
     joint_dec: float = DEFAULT_JOG_ANY_JOINT_DEC,
+    safe_tcp_z_min_m: float | None = DEFAULT_SAFE_TCP_Z_MIN_M,
+    safe_tcp_z_max_m: float | None = DEFAULT_SAFE_TCP_Z_MAX_M,
+    print_ik_tcp_pose: bool = DEFAULT_PRINT_IK_TCP_POSE,
+    print_ik_tcp_pose_interval_s: float = DEFAULT_PRINT_IK_TCP_POSE_INTERVAL_S,
     visualize_placo: bool = False,
     control_rate_hz: int = 50,
     enable_log_data: bool = True,
+    enable_lerobot_log: bool = False,
+    lerobot_root: str = "data/lerobot/tb6r5_live",
+    lerobot_repo_id: str = "local/tb6r5_live",
+    lerobot_task: str = "tb6r5 teleoperation",
+    lerobot_streaming_encoding: bool = True,
+    lerobot_overwrite: bool = False,
+    lerobot_resume: bool = False,
+    lerobot_image_writer_processes: int = 0,
+    lerobot_image_writer_threads: int = 4,
+    lerobot_encoder_threads: int = 2,
     log_dir: str = "logs/tb6r5",
     log_freq: float = 50,
     enable_camera: bool = True,
@@ -89,6 +116,11 @@ def main(
     gripper_open_cmd: float = DEFAULT_GRIPPER_OPEN_CMD,
     gripper_closed_cmd: float = DEFAULT_GRIPPER_CLOSED_CMD,
     gripper_observation_default: float = DEFAULT_GRIPPER_OBSERVATION,
+    joystick_controller: str = DEFAULT_JOYSTICK_CONTROLLER,
+    joystick_axis_click: str = DEFAULT_JOYSTICK_AXIS_CLICK,
+    gripper_max_d: float = DEFAULT_GRIPPER_MAX_D,
+    two_fingers_gripper_interval: float = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+    disable_gripper: bool = False,
     teleop_mode: TeleopMode = DEFAULT_TELEOP_MODE,
     jog_any_c_preview: bool = False,
 ):
@@ -119,10 +151,24 @@ def main(
         joint_vel=joint_vel,
         joint_acc=joint_acc,
         joint_dec=joint_dec,
+        safe_tcp_z_min_m=safe_tcp_z_min_m,
+        safe_tcp_z_max_m=safe_tcp_z_max_m,
+        print_ik_tcp_pose=print_ik_tcp_pose,
+        print_ik_tcp_pose_interval_s=print_ik_tcp_pose_interval_s,
         jog_any_c_preview_only=jog_any_c_preview,
         visualize_placo=visualize_placo,
         control_rate_hz=control_rate_hz,
         enable_log_data=enable_log_data,
+        enable_lerobot_log=enable_lerobot_log,
+        lerobot_root=lerobot_root,
+        lerobot_repo_id=lerobot_repo_id,
+        lerobot_task=lerobot_task,
+        lerobot_streaming_encoding=lerobot_streaming_encoding,
+        lerobot_overwrite=lerobot_overwrite,
+        lerobot_resume=lerobot_resume,
+        lerobot_image_writer_processes=lerobot_image_writer_processes,
+        lerobot_image_writer_threads=lerobot_image_writer_threads,
+        lerobot_encoder_threads=lerobot_encoder_threads,
         log_dir=log_dir,
         log_freq=log_freq,
         enable_camera=enable_camera,
@@ -139,6 +185,11 @@ def main(
         gripper_open_cmd=gripper_open_cmd,
         gripper_closed_cmd=gripper_closed_cmd,
         gripper_observation_default=gripper_observation_default,
+        joystick_controller=joystick_controller,
+        joystick_axis_click=joystick_axis_click,
+        gripper_max_d=gripper_max_d,
+        two_fingers_gripper_interval=two_fingers_gripper_interval,
+        disable_gripper=disable_gripper,
     )
     controller.run()
 

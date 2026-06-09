@@ -5,7 +5,8 @@ import numpy as np
 from .base_camera import BaseCameraInterface
 from ...utils.image_utils import compress_image_to_jpg
 import pyrealsense2 as rs
-
+# Initialized RealSense camera: 135522071053
+# Initialized RealSense camera: 327122073649
 
 class RealSenseCameraInterface(BaseCameraInterface):
     """

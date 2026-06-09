@@ -1,4 +1,5 @@
 # First import the library
+# 
 import cv2
 import numpy as np
 
@@ -11,13 +12,14 @@ from xrobotoolkit_teleop.hardware.interface.realsense import (
 def main():
     try:
         with RealSenseCameraInterface() as camera_interface:
-            print(get_supported_resolutions("215222077461"))
+            print(get_supported_resolutions("135522071053"))
             while True:
                 camera_interface.update_frames()  # Fetch new frames from cameras
                 frames_dict = camera_interface.get_frames()
 
                 for serial, frames in frames_dict.items():
-                    color_image = frames["color"]
+                    # RealSense color stream is rgb8; OpenCV imshow expects bgr8
+                    color_image = cv2.cvtColor(frames["color"], cv2.COLOR_RGB2BGR)
                     depth_image = frames["depth"]
 
                     depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)

@@ -7,7 +7,8 @@ import subprocess
 import threading
 import time
 import ctypes
-from typing import Literal, Optional, Tuple
+from contextlib import contextmanager
+from typing import Callable, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -25,8 +26,46 @@ DEFAULT_JOG_ANY_JOINT_VEL = 1.0
 DEFAULT_JOG_ANY_JOINT_ACC = 1.0
 DEFAULT_JOG_ANY_JOINT_DEC = 1.0
 DEFAULT_JOG_ASYNC_TIMEOUT_MS = 5000000
+# MoveTwoFingersGripper: distance=0 open, distance=max closed (controller units).
+DEFAULT_GRIPPER_MAX_D = 12.0
+DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL = 25.0
+# VR joystick axes are in [-1, 1]; |axis|==1 is full stick deflection.
+JOYSTICK_AXIS_DEFLECTION_MAX = 1.0
 # Back-compat alias used by CLI / controller imports
 DEFAULT_JOG_ANY_C_ASYNC_TIMEOUT_MS = DEFAULT_JOG_ASYNC_TIMEOUT_MS
+
+
+def _should_drop_jog_any_j_rpc_log(line: str) -> bool:
+    return "JogAnyJ" in line and ("[async] msg:" in line or "[await] msg:" in line)
+
+
+@contextmanager
+def _filter_stdout_lines(should_drop: Callable[[str], bool]):
+    """Drop matching stdout lines emitted by rpc.so during a synchronous call."""
+    read_fd, write_fd = os.pipe()
+    saved_stdout = os.dup(1)
+    try:
+        os.dup2(write_fd, 1)
+        os.close(write_fd)
+        yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        captured = b""
+        while True:
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            captured += chunk
+        os.close(read_fd)
+        if captured:
+            text = captured.decode("utf-8", errors="replace")
+            if not text.endswith("\n"):
+                text += "\n"
+            for line in text.splitlines(keepends=True):
+                if should_drop(line):
+                    continue
+                os.write(saved_stdout, line.encode("utf-8", errors="replace"))
+        os.close(saved_stdout)
 
 
 def _platform_subdir() -> str:
@@ -293,6 +332,7 @@ class TB6R5Interface:
             "{Start}",
             "{Var --clear}",
             "{Recover}",
+            "{SetUsingSP --state=on}",
             "{Var --type=jointtarget --name=teleop --value={0,0,0,0,0,0,0,0,0,0}}",
         ]
         for cmd in init_cmds:
@@ -480,7 +520,8 @@ class TB6R5Interface:
         return bool(ok)
 
     def _send_jog_any_j_async(self, cmd: str, move_timeout_ms: Optional[int] = None) -> bool:
-        return self._send_jog_async(cmd, "JogAnyJ", move_timeout_ms)
+        with _filter_stdout_lines(_should_drop_jog_any_j_rpc_log):
+            return self._send_jog_async(cmd, "JogAnyJ", move_timeout_ms)
 
     def _send_jog_any_c_async(self, cmd: str, move_timeout_ms: Optional[int] = None) -> bool:
         return self._send_jog_async(cmd, "JogAnyC", move_timeout_ms)
@@ -696,7 +737,55 @@ class TB6R5Interface:
         self._cartesian_stream_count += 1
         return True
 
+    @staticmethod
+    def gripper_distance_from_joystick_axes(
+        axis_x: float,
+        axis_y: float,
+        max_distance: float = DEFAULT_GRIPPER_MAX_D,
+    ) -> float:
+        """Map VR joystick axes to MoveTwoFingersGripper distance.
+
+        Args:
+            axis_x, axis_y: Joystick components in [-1, 1] (0 = centered).
+            max_distance: Fully closed distance sent to RPC (default 12).
+
+        Returns:
+            distance in [0, max_distance]:
+              0            -> fully open
+              max_distance -> fully closed
+
+        Mapping (Chebyshev / L-inf norm on |axis|):
+            deflection = min(1, max(|axis_x|, |axis_y|))
+            distance = max_distance * deflection
+
+        So either axis alone can drive the full open->closed range; diagonal push
+        does not require both axes at 1.0 (unlike the old axis_x^2+axis_y^2 map).
+        """
+        deflection = min(
+            1.0,
+            max(abs(float(axis_x)), abs(float(axis_y))) / JOYSTICK_AXIS_DEFLECTION_MAX,
+        )
+        deflection = max(0.0, deflection)
+        return float(max_distance) * deflection
+
+    def move_two_fingers_gripper(
+        self,
+        distance: float,
+        interval: Optional[float] = None,
+        max_distance: Optional[float] = None,
+    ) -> bool:
+        """Send MoveTwoFingersGripper (distance 0=open, larger=more closed)."""
+        if max_distance is None:
+            max_distance = DEFAULT_GRIPPER_MAX_D
+        if interval is None:
+            interval = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL
+        distance = max(0.0, min(float(distance), float(max_distance)))
+        interval = max(0.0, float(interval))
+        cmd = f"{{MoveTwoFingersGripper --distance={distance:.4f} --interval={interval:.4f}}}"
+        return self._send_rpc_sync(cmd, timeout_ms=5000)
+
     def stop(self):
+        self._wait_jog_async_pending(timeout_s=0.5)
         self._send_rpc_sync("{Stop}", timeout_ms=3000)
 
     def go_home(self, q: Optional[np.ndarray] = None):

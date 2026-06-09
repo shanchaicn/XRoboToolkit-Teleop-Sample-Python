@@ -11,6 +11,18 @@ from xrobotoolkit_teleop.common.base_teleop_controller import BaseTeleopControll
 from xrobotoolkit_teleop.hardware.interface.base_camera import BaseCameraInterface
 
 
+def _opencv_gui_available() -> bool:
+    """Return False when OpenCV lacks highgui (headless build or broken cv2 install)."""
+    if not hasattr(cv2, "namedWindow") or not hasattr(cv2, "destroyWindow"):
+        return False
+    try:
+        cv2.namedWindow("_xrt_opencv_gui_probe_", cv2.WINDOW_AUTOSIZE)
+        cv2.destroyWindow("_xrt_opencv_gui_probe_")
+        return True
+    except Exception:
+        return False
+
+
 class HardwareTeleopController(BaseTeleopController, ABC):
     """
     An abstract base class for hardware teleoperation controllers that consolidates
@@ -166,7 +178,7 @@ class HardwareTeleopController(BaseTeleopController, ABC):
     def _check_logging_button(self):
         """Checks for the 'B' button press to toggle data logging."""
         b_button_state = self.xr_client.get_button_state_by_name("B")
-        right_axis_click = self.xr_client.get_button_state_by_name("right_axis_click")
+        left_axis_click = self.xr_client.get_button_state_by_name("left_axis_click")
 
         if b_button_state and not self._prev_b_button_state:
             self._is_logging = not self._is_logging
@@ -177,7 +189,7 @@ class HardwareTeleopController(BaseTeleopController, ABC):
                 self.data_logger.save()
                 self.data_logger.reset()
 
-        if right_axis_click and self._is_logging:
+        if left_axis_click and self._is_logging:
             print("--- Stopped data logging. Discarding data... ---")
             self.data_logger.reset()
             self._is_logging = False
@@ -190,83 +202,94 @@ class HardwareTeleopController(BaseTeleopController, ABC):
             return
 
         print("Camera thread started.")
+        show_preview = _opencv_gui_available()
+        if not show_preview:
+            print(
+                "[teleop] OpenCV has no GUI support (headless). "
+                "Camera preview disabled; compressed logging still works."
+            )
+
         window_name = "Hardware Cameras"
         window_created = False
 
         try:
             while not stop_event.is_set():
                 self.camera_interface.update_frames()
-                if self._is_logging:
+
+                if self._is_logging and show_preview:
                     if not window_created:
-                        cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-                        window_created = True
+                        try:
+                            cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+                            window_created = True
+                        except Exception:
+                            show_preview = False
+                            print("[teleop] Camera preview disabled after OpenCV GUI error.")
 
-                    frames_dict = self.camera_interface.get_frames()
-                    if not frames_dict:
-                        time.sleep(1.0 / self.camera_fps)
-                        continue
+                    if show_preview and window_created:
+                        frames_dict = self.camera_interface.get_frames()
+                        if frames_dict:
+                            all_camera_rows = []
+                            for name in sorted(frames_dict.keys()):
+                                frames = frames_dict[name]
+                                images_in_row = []
 
-                    all_camera_rows = []
-                    sorted_camera_names = sorted(frames_dict.keys())
+                                color_image = frames.get("color")
+                                if color_image is not None:
+                                    if len(color_image.shape) == 2:
+                                        color_image = cv2.cvtColor(color_image, cv2.COLOR_GRAY2BGR)
+                                    images_in_row.append(color_image)
 
-                    for name in sorted_camera_names:
-                        frames = frames_dict[name]
-                        images_in_row = []
+                                depth_image = frames.get("depth")
+                                if depth_image is not None:
+                                    depth_colormap = cv2.applyColorMap(
+                                        cv2.convertScaleAbs(depth_image, alpha=0.03),
+                                        cv2.COLORMAP_JET,
+                                    )
+                                    images_in_row.append(depth_colormap)
 
-                        color_image = frames.get("color")
-                        if color_image is not None:
-                            if len(color_image.shape) == 2:
-                                color_image = cv2.cvtColor(color_image, cv2.COLOR_GRAY2BGR)
-                            images_in_row.append(color_image)
+                                if images_in_row:
+                                    all_camera_rows.append(np.hstack(images_in_row))
 
-                        depth_image = frames.get("depth")
-                        if depth_image is not None:
-                            depth_colormap = cv2.applyColorMap(
-                                cv2.convertScaleAbs(depth_image, alpha=0.03),
-                                cv2.COLORMAP_JET,
-                            )
-                            images_in_row.append(depth_colormap)
+                            if all_camera_rows:
+                                max_width = max(row.shape[1] for row in all_camera_rows)
+                                padded_rows = [
+                                    (
+                                        np.hstack(
+                                            [
+                                                row,
+                                                np.zeros(
+                                                    (row.shape[0], max_width - row.shape[1], 3),
+                                                    dtype=np.uint8,
+                                                ),
+                                            ]
+                                        )
+                                        if row.shape[1] < max_width
+                                        else row
+                                    )
+                                    for row in all_camera_rows
+                                ]
+                                if padded_rows:
+                                    combined_image = np.vstack(padded_rows)
+                                    cv2.imshow(
+                                        window_name,
+                                        cv2.cvtColor(combined_image, cv2.COLOR_RGB2BGR),
+                                    )
 
-                        if images_in_row:
-                            all_camera_rows.append(np.hstack(images_in_row))
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
+                elif window_created:
+                    cv2.destroyWindow(window_name)
+                    window_created = False
 
-                    if all_camera_rows:
-                        max_width = max(row.shape[1] for row in all_camera_rows)
-                        padded_rows = [
-                            (
-                                np.hstack(
-                                    [
-                                        row,
-                                        np.zeros(
-                                            (row.shape[0], max_width - row.shape[1], 3),
-                                            dtype=np.uint8,
-                                        ),
-                                    ]
-                                )
-                                if row.shape[1] < max_width
-                                else row
-                            )
-                            for row in all_camera_rows
-                        ]
-                        if padded_rows:
-                            combined_image = np.vstack(padded_rows)
-                            cv2.imshow(
-                                window_name,
-                                cv2.cvtColor(combined_image, cv2.COLOR_RGB2BGR),
-                            )
-
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
-                else:
-                    if window_created:
-                        cv2.destroyWindow(window_name)
-                        window_created = False
-                    time.sleep(1.0 / self.camera_fps)
+                time.sleep(1.0 / self.camera_fps)
         finally:
             if self.camera_interface:
                 self.camera_interface.stop()
             if window_created:
-                cv2.destroyAllWindows()
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
             print("Camera thread has stopped.")
 
     def _should_keep_running(self) -> bool:

@@ -10,12 +10,15 @@ from placo_utils.visualization import frame_viz
 from xrobotoolkit_teleop.common.base_hardware_teleop_controller import (
     HardwareTeleopController,
 )
+from xrobotoolkit_teleop.common.lerobot_v3_logger import TB6LeRobotV3Logger
 from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
     DEFAULT_JOG_ANY_C_ASYNC_TIMEOUT_MS,
     DEFAULT_JOG_ANY_JOINT_ACC,
     DEFAULT_JOG_ANY_JOINT_DEC,
     DEFAULT_JOG_ANY_JOINT_VEL,
     DEFAULT_TELEOP_MODE,
+    DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+    DEFAULT_GRIPPER_MAX_D,
     DEFAULT_ZONE_RATIO,
     TB6R5Interface,
     TeleopMode,
@@ -37,15 +40,18 @@ TB6R5_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 DEFAULT_SCALE_FACTOR = 1.5
 DEFAULT_ROBOT_IP = "192.168.11.11"
 DEFAULT_RPC_PORT = 5868
-DEFAULT_HOME_JOINT_DEG = (0.0, -90.0, 90.0, -90.0, -90.0, 0.0)
+DEFAULT_HOME_JOINT_DEG = (15.0, -100.0, 90.0, -80.0, -90.0, -45.0)
 # RevA1 URDF sets velocity="0" on every joint; Placo then caps |dq| to 0 per step.
 DEFAULT_PLACO_JOINT_VMAX_RAD_S = 3.14
-DEFAULT_LOG_JOINT_COUNT = 7
+DEFAULT_LOG_JOINT_COUNT = 6 # 6 Joints in the URDF
 DEFAULT_GRIPPER_TRIGGER_NAME = "right_trigger"
 DEFAULT_GRIPPER_TRIGGER_THRESHOLD = 0.5
 DEFAULT_GRIPPER_OPEN_CMD = 0.0
 DEFAULT_GRIPPER_CLOSED_CMD = 1.0
 DEFAULT_GRIPPER_OBSERVATION = 0.0
+DEFAULT_JOYSTICK_CONTROLLER = "right"
+DEFAULT_JOYSTICK_AXIS_CLICK = "right_axis_click"
+DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA = 0.5
 DEFAULT_REALSENSE_SERIAL_DICT = {
     "realsense_0": "135522071053",
     "realsense_1": "327122073649",
@@ -56,6 +62,11 @@ DEFAULT_CARTESIAN_MAX_STEP_POS_M = 0.03
 DEFAULT_CARTESIAN_MAX_STEP_ROT_RAD = 0.1
 DEFAULT_JOG_ANY_C_POSITION_ONLY = True
 DEFAULT_JOG_ANY_C_ORIENTATION_ONLY = False
+## IK发送给机器人时，TCP Z的限制 (m)
+DEFAULT_SAFE_TCP_Z_MIN_M: Optional[float] = 0.05 
+DEFAULT_SAFE_TCP_Z_MAX_M: Optional[float] = 0.65
+DEFAULT_PRINT_IK_TCP_POSE = False
+DEFAULT_PRINT_IK_TCP_POSE_INTERVAL_S = 0.2
 JogAnyCInterruptMode = Literal["on", "off"]
 DEFAULT_JOG_ANY_C_INTERRUPT: JogAnyCInterruptMode = "off"
 CARTESIAN_WARMUP_FRAMES = 0
@@ -123,6 +134,12 @@ class TB6R5TeleopController(HardwareTeleopController):
         gripper_open_cmd: float = DEFAULT_GRIPPER_OPEN_CMD,
         gripper_closed_cmd: float = DEFAULT_GRIPPER_CLOSED_CMD,
         gripper_observation_default: float = DEFAULT_GRIPPER_OBSERVATION,
+        joystick_controller: str = DEFAULT_JOYSTICK_CONTROLLER,
+        joystick_axis_click: str = DEFAULT_JOYSTICK_AXIS_CLICK,
+        gripper_max_d: float = DEFAULT_GRIPPER_MAX_D,
+        two_fingers_gripper_interval: float = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+        two_fingers_gripper_cmd_delta: float = DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA,
+        disable_gripper: bool = False,
         teleop_mode: TeleopMode = DEFAULT_TELEOP_MODE,
         cartesian_max_step_pos_m: float = DEFAULT_CARTESIAN_MAX_STEP_POS_M,
         cartesian_max_step_rot_rad: float = DEFAULT_CARTESIAN_MAX_STEP_ROT_RAD,
@@ -137,6 +154,20 @@ class TB6R5TeleopController(HardwareTeleopController):
         joint_vel: float = DEFAULT_JOG_ANY_JOINT_VEL,
         joint_acc: float = DEFAULT_JOG_ANY_JOINT_ACC,
         joint_dec: float = DEFAULT_JOG_ANY_JOINT_DEC,
+        safe_tcp_z_min_m: Optional[float] = DEFAULT_SAFE_TCP_Z_MIN_M,
+        safe_tcp_z_max_m: Optional[float] = DEFAULT_SAFE_TCP_Z_MAX_M,
+        print_ik_tcp_pose: bool = DEFAULT_PRINT_IK_TCP_POSE,
+        print_ik_tcp_pose_interval_s: float = DEFAULT_PRINT_IK_TCP_POSE_INTERVAL_S,
+        enable_lerobot_log: bool = False,
+        lerobot_root: str = "data/lerobot/tb6r5_live",
+        lerobot_repo_id: str = "local/tb6r5_live",
+        lerobot_task: str = "tb6r5 teleoperation",
+        lerobot_streaming_encoding: bool = True,
+        lerobot_overwrite: bool = False,
+        lerobot_resume: bool = False,
+        lerobot_image_writer_processes: int = 0,
+        lerobot_image_writer_threads: int = 4,
+        lerobot_encoder_threads: int = 2,
         jog_any_c_preview_only: bool = False,
     ):
         self.robot_ip = robot_ip
@@ -160,6 +191,27 @@ class TB6R5TeleopController(HardwareTeleopController):
         self.joint_vel = float(joint_vel)
         self.joint_acc = float(joint_acc)
         self.joint_dec = float(joint_dec)
+        self.safe_tcp_z_min_m = safe_tcp_z_min_m if safe_tcp_z_min_m is None else float(safe_tcp_z_min_m)
+        self.safe_tcp_z_max_m = safe_tcp_z_max_m if safe_tcp_z_max_m is None else float(safe_tcp_z_max_m)
+        if (
+            self.safe_tcp_z_min_m is not None
+            and self.safe_tcp_z_max_m is not None
+            and self.safe_tcp_z_min_m > self.safe_tcp_z_max_m
+        ):
+            raise ValueError("safe_tcp_z_min_m must be <= safe_tcp_z_max_m")
+        self.print_ik_tcp_pose = bool(print_ik_tcp_pose)
+        self.print_ik_tcp_pose_interval_s = max(float(print_ik_tcp_pose_interval_s), 0.02)
+        self.enable_lerobot_log = bool(enable_lerobot_log)
+        self.lerobot_root = str(lerobot_root)
+        self.lerobot_repo_id = str(lerobot_repo_id)
+        self.lerobot_task = str(lerobot_task)
+        self.lerobot_streaming_encoding = bool(lerobot_streaming_encoding)
+        self.lerobot_overwrite = bool(lerobot_overwrite)
+        self.lerobot_resume = bool(lerobot_resume)
+        self.lerobot_image_writer_processes = int(lerobot_image_writer_processes)
+        self.lerobot_image_writer_threads = int(lerobot_image_writer_threads)
+        self.lerobot_encoder_threads = int(lerobot_encoder_threads)
+        self.lerobot_logger: Optional[TB6LeRobotV3Logger] = None
         self.enable_camera = enable_camera
         self.control_rate_hz = control_rate_hz
         self.sim_only = _is_sim_only(robot_ip)
@@ -170,6 +222,16 @@ class TB6R5TeleopController(HardwareTeleopController):
         self.gripper_open_cmd = float(gripper_open_cmd)
         self.gripper_closed_cmd = float(gripper_closed_cmd)
         self.gripper_observation_default = float(gripper_observation_default)
+        self.joystick_controller = str(joystick_controller).lower()
+        self.joystick_axis_click = str(joystick_axis_click)
+        self.gripper_max_d = max(float(gripper_max_d), 0.0)
+        self.two_fingers_gripper_interval = max(float(two_fingers_gripper_interval), 0.0)
+        self.two_fingers_gripper_cmd_delta = max(float(two_fingers_gripper_cmd_delta), 0.0)
+        self.disable_gripper = bool(disable_gripper)
+        self._last_gripper_distance_cmd: Optional[float] = None
+        self._last_gripper_rpc_time = 0.0
+        self._prev_joystick_axis_click = False
+        self._gripper_stream_active = False
         self._last_gripper_action_cmd = self.gripper_open_cmd
         self.camera_serial_dict = camera_serial_dict or DEFAULT_REALSENSE_SERIAL_DICT
         self.camera_serial_to_name = {serial: name for name, serial in self.camera_serial_dict.items()}
@@ -180,6 +242,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         self.enable_camera_compression = enable_camera_compression
         self.camera_jpg_quality = camera_jpg_quality
         self._prev_a_button_state = False
+        self._prev_x_button_state = False
         self._home_q = np.deg2rad(DEFAULT_HOME_JOINT_DEG)
         self._cartesian_target: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._cartesian_last_target: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -203,6 +266,8 @@ class TB6R5TeleopController(HardwareTeleopController):
         self._last_preview_cmd_print = 0.0
         self._last_jog_any_j_preview_print = 0.0
         self._last_jog_any_j_preview_q: Optional[np.ndarray] = None
+        self._last_z_guard_print_time: Dict[str, float] = {}
+        self._last_tcp_pose_print_time: Dict[str, float] = {}
         self._joint_preview_stream_count: Dict[str, int] = {}
         self._jog_any_c_cmd_formatter: Optional[TB6R5Interface] = None
         if self.jog_any_c_preview_only:
@@ -276,6 +341,46 @@ class TB6R5TeleopController(HardwareTeleopController):
             f"[TB6R5] Grip trigger hysteresis: activate > {self.grip_threshold:.2f}, "
             f"release <= {self.grip_release_threshold:.2f}."
         )
+        if self.safe_tcp_z_min_m is not None or self.safe_tcp_z_max_m is not None:
+            print(
+                "[TB6R5] TCP Z safety guard enabled: "
+                f"min={self.safe_tcp_z_min_m}, max={self.safe_tcp_z_max_m} (meters, base frame)."
+            )
+        if self.print_ik_tcp_pose:
+            print(f"[TB6R5] IK TCP pose print enabled (interval={self.print_ik_tcp_pose_interval_s:.2f}s).")
+        self._init_lerobot_logger()
+
+    def _init_lerobot_logger(self):
+        if not self.enable_lerobot_log:
+            return
+        if not self.enable_log_data:
+            raise ValueError("enable_lerobot_log requires enable_log_data=True")
+        camera_names = sorted(self.camera_serial_dict.keys()) if self.enable_camera else []
+        vector_dim = self.log_joint_count + 1
+        self.lerobot_logger = TB6LeRobotV3Logger(
+            root=self.lerobot_root,
+            repo_id=self.lerobot_repo_id,
+            fps=int(self.log_freq),
+            task=self.lerobot_task,
+            camera_names=camera_names,
+            state_dim=vector_dim,
+            action_dim=vector_dim,
+            image_height=self.camera_height,
+            image_width=self.camera_width,
+            use_videos=True,
+            include_depth=self.enable_camera_depth,
+            overwrite=self.lerobot_overwrite,
+            resume=self.lerobot_resume,
+            streaming_encoding=self.lerobot_streaming_encoding,
+            image_writer_processes=self.lerobot_image_writer_processes,
+            image_writer_threads=self.lerobot_image_writer_threads,
+            encoder_threads=self.lerobot_encoder_threads,
+        )
+        print(
+            "[TB6R5] LeRobot v3 online logging enabled "
+            f"(root={self.lerobot_root}, repo_id={self.lerobot_repo_id}). "
+            "B: start/stop episode; A: discard; no .pkl per segment."
+        )
 
     # ------------------------------------------------------------------
     # Placo setup
@@ -346,6 +451,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         if self.arm is None:
             return
         print("Shutting down TB6-R5 ...")
+        self._open_gripper_for_home()
         self.arm.go_home(self._home_q)
         time.sleep(1.0)
         self.arm.disable()
@@ -357,16 +463,163 @@ class TB6R5TeleopController(HardwareTeleopController):
 
     def _pre_ik_update(self):
         self._check_home_button()
+        self._check_joystick_axis_click_gripper_toggle()
+
+    def _update_gripper_target(self):
+        """Joystick axisX/axisY -> MoveTwoFingersGripper when stream is toggled on."""
+        if self.disable_gripper or not self._gripper_stream_active or self.arm is None:
+            return
+        try:
+            axis_x, axis_y = self.xr_client.get_joystick_state(self.joystick_controller)
+        except Exception:
+            return
+
+        distance = TB6R5Interface.gripper_distance_from_joystick_axes(
+            axis_x,
+            axis_y,
+            self.gripper_max_d,
+        )
+        self._last_gripper_action_cmd = (
+            self.gripper_closed_cmd
+            if distance >= self.gripper_max_d - 1e-6
+            else self.gripper_open_cmd
+        )
+
+        now = time.time()
+        if self._last_gripper_distance_cmd is not None:
+            if abs(distance - self._last_gripper_distance_cmd) < self.two_fingers_gripper_cmd_delta:
+                if now - self._last_gripper_rpc_time < self._min_gripper_rpc_interval_s():
+                    return
+
+        self.arm.move_two_fingers_gripper(
+            distance,
+            interval=self.two_fingers_gripper_interval,
+            max_distance=self.gripper_max_d,
+        )
+        self._last_gripper_distance_cmd = distance
+        self._last_gripper_rpc_time = now
+
+    @staticmethod
+    def _min_gripper_rpc_interval_s() -> float:
+        return 0.05
+
+    def _check_joystick_axis_click_gripper_toggle(self):
+        """Joystick axis click toggles MoveTwoFingersGripper streaming on/off."""
+        if self.disable_gripper:
+            return
+        try:
+            clicked = self.xr_client.get_button_state_by_name(self.joystick_axis_click)
+        except Exception:
+            clicked = False
+
+        if clicked and not self._prev_joystick_axis_click:
+            self._gripper_stream_active = not self._gripper_stream_active
+            state = "ON" if self._gripper_stream_active else "OFF"
+            print(
+                f"[TB6R5] {self.joystick_axis_click}: gripper stream {state} "
+                f"(gripper_max_d={self.gripper_max_d:.0f}, "
+                f"interval={self.two_fingers_gripper_interval:.0f})"
+            )
+            if not self._gripper_stream_active:
+                self._last_gripper_distance_cmd = None
+
+        self._prev_joystick_axis_click = clicked
 
     def _check_home_button(self):
-        """Press A once to move the arm to DEFAULT_HOME_JOINT_DEG."""
-        a_pressed = self.xr_client.get_button_state_by_name("A")
-        if a_pressed and not self._prev_a_button_state:
+        """Press X: move to DEFAULT_HOME_JOINT_DEG."""
+        x_pressed = self.xr_client.get_button_state_by_name("X")
+        if x_pressed and not self._prev_x_button_state:
+            print("[TB6R5] X button: home")
             self._go_to_home_pose()
-        self._prev_a_button_state = a_pressed
+        self._prev_x_button_state = x_pressed
+
+    def _check_logging_button(self):
+        """TB6 key mapping: B toggle/save(+home), A discard current logging."""
+        b_button_state = self.xr_client.get_button_state_by_name("B")
+        a_button_state = self.xr_client.get_button_state_by_name("A")
+
+        if b_button_state and not self._prev_b_button_state:
+            self._is_logging = not self._is_logging
+            if self._is_logging:
+                print("--- Started data logging ---")
+                if self.lerobot_logger is not None:
+                    self.lerobot_logger.begin_episode()
+            else:
+                print("--- Stopped data logging. Saving data... ---")
+                if self.lerobot_logger is not None:
+                    self.lerobot_logger.save_episode()
+                elif self.data_logger is not None:
+                    self.data_logger.save()
+                    self.data_logger.reset()
+                print("[TB6R5] B button: saved log and returning home")
+                self._go_to_home_pose()
+
+        if a_button_state and not self._prev_a_button_state:
+            if self._is_logging:
+                print("--- Stopped data logging. Discarding data... ---")
+                if self.lerobot_logger is not None:
+                    self.lerobot_logger.discard_episode()
+                elif self.data_logger is not None:
+                    self.data_logger.reset()
+                self._is_logging = False
+                print("[TB6R5] A button: discarded log and returning home")
+            else:
+                print("[TB6R5] A button: returning home")
+            self._go_to_home_pose()
+
+        self._prev_b_button_state = b_button_state
+        self._prev_a_button_state = a_button_state
+
+    def _log_data(self):
+        if not self.enable_log_data:
+            return
+
+        timestamp = time.time() - self._start_time
+        data_entry = {"timestamp": timestamp}
+        data_entry.update(self._get_robot_state_for_logging())
+
+        if self.enable_camera and self.camera_interface:
+            frames = self._get_camera_frame_for_logging()
+            if frames:
+                data_entry["image"] = frames
+
+        if self.lerobot_logger is not None:
+            self.lerobot_logger.add_tb6_entry(data_entry)
+            return
+
+        if self.data_logger is not None:
+            self.data_logger.add_entry(data_entry)
+
+    def run(self):
+        if self.lerobot_logger is not None:
+            from lerobot.datasets.video_utils import VideoEncodingManager
+
+            with VideoEncodingManager(self.lerobot_logger.dataset):
+                super().run()
+            return
+        super().run()
+
+    def _open_gripper_for_home(self) -> None:
+        """Open gripper once before homing (sequential RPC, avoids blocking during arm move)."""
+        if self.disable_gripper or self.arm is None:
+            return
+        print(
+            f"[TB6R5] Homing: MoveTwoFingersGripper(distance=0, "
+            f"interval={self.two_fingers_gripper_interval:.0f})"
+        )
+        self.arm.move_two_fingers_gripper(
+            distance=0.0,
+            interval=self.two_fingers_gripper_interval,
+            max_distance=self.gripper_max_d,
+        )
+        self._last_gripper_distance_cmd = 0.0
+        self._last_gripper_action_cmd = self.gripper_open_cmd
+        self._last_gripper_rpc_time = time.time()
 
     def _go_to_home_pose(self):
-        print(f"[TB6R5] A button: homing to {DEFAULT_HOME_JOINT_DEG} deg")
+        print(f"[TB6R5] Homing to {DEFAULT_HOME_JOINT_DEG} deg")
+        self._gripper_stream_active = False
+        self._last_gripper_distance_cmd = None
         self.placo_robot.state.q[self.joint_slice] = self._home_q.copy()
         self.placo_robot.update_kinematics()
         self.sync_end_effector_poses_to_placo_tasks()
@@ -391,6 +644,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         self._preview_stream_count.clear()
 
         if self.arm is not None:
+            self._open_gripper_for_home()
             self.arm.go_home(self._home_q)
         self._last_home_time = time.time()
 
@@ -986,6 +1240,9 @@ class TB6R5TeleopController(HardwareTeleopController):
                 if target is None:
                     continue
                 xyz, quat = target
+                self._maybe_print_ik_tcp_pose(name, xyz, quat, tag="JogAnyC target")
+                if not self._is_tcp_z_safe(name, xyz):
+                    continue
                 if self.jog_any_c_preview_only:
                     stream_count = self._preview_stream_count.get(name, 0)
                     cmd = self._format_preview_jog_any_c_cmd(xyz, quat, stream_count)
@@ -1022,10 +1279,51 @@ class TB6R5TeleopController(HardwareTeleopController):
         for name in self.manipulator_config:
             if self.active.get(name, False):
                 q_des = self.placo_robot.state.q[self.joint_slice].copy()
+                target_xyz, target_quat = self._get_link_pose(self.manipulator_config[name]["link_name"])
+                self._maybe_print_ik_tcp_pose(name, target_xyz, target_quat, tag="IK TCP")
+                if not self._is_tcp_z_safe(name, target_xyz):
+                    continue
                 if self.sim_only:
                     self._preview_or_apply_sim_joint_target(q_des, name)
                 elif self.arm is not None:
                     self.arm.set_joint_positions(q_des, force=True)
+
+    def _is_tcp_z_safe(self, src_name: str, target_xyz: np.ndarray) -> bool:
+        z = float(target_xyz[2])
+        if self.safe_tcp_z_min_m is not None and z < self.safe_tcp_z_min_m:
+            self._warn_tcp_z_block(src_name, z, "below", self.safe_tcp_z_min_m)
+            return False
+        if self.safe_tcp_z_max_m is not None and z > self.safe_tcp_z_max_m:
+            self._warn_tcp_z_block(src_name, z, "above", self.safe_tcp_z_max_m)
+            return False
+        return True
+
+    def _warn_tcp_z_block(self, src_name: str, z: float, relation: str, limit: float) -> None:
+        now = time.time()
+        last = self._last_z_guard_print_time.get(src_name, 0.0)
+        if now - last < 0.5:
+            return
+        self._last_z_guard_print_time[src_name] = now
+        print(
+            f"[TB6R5] {src_name}: blocked command by TCP Z guard "
+            f"(z={z:.4f} m, {relation} limit={limit:.4f} m)."
+        )
+
+    def _maybe_print_ik_tcp_pose(self, src_name: str, xyz: np.ndarray, quat_wxyz: np.ndarray, tag: str) -> None:
+        if not self.print_ik_tcp_pose:
+            return
+        now = time.time()
+        last = self._last_tcp_pose_print_time.get(src_name, 0.0)
+        if now - last < self.print_ik_tcp_pose_interval_s:
+            return
+        self._last_tcp_pose_print_time[src_name] = now
+        x, y, z = [float(v) for v in xyz[:3]]
+        qw, qx, qy, qz = [float(v) for v in quat_wxyz[:4]]
+        print(
+            f"[TB6R5] {src_name} {tag}: "
+            f"xyz=({x:.4f}, {y:.4f}, {z:.4f}) m, "
+            f"quat_wxyz=({qw:.4f}, {qx:.4f}, {qy:.4f}, {qz:.4f})"
+        )
 
     # ------------------------------------------------------------------
     # Logging
@@ -1042,13 +1340,8 @@ class TB6R5TeleopController(HardwareTeleopController):
         return result
 
     def _get_gripper_action_for_logging(self) -> float:
-        try:
-            trigger_value = self.xr_client.get_key_value_by_name(self.gripper_trigger_name)
-        except Exception:
-            trigger_value = 0.0
-        self._last_gripper_action_cmd = (
-            self.gripper_closed_cmd if trigger_value > self.gripper_trigger_threshold else self.gripper_open_cmd
-        )
+        if self._last_gripper_distance_cmd is not None and self.gripper_max_d > 0.0:
+            return self._last_gripper_distance_cmd / self.gripper_max_d
         return self._last_gripper_action_cmd
 
     def _get_robot_state_for_logging(self) -> Dict:

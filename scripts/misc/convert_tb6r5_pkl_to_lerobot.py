@@ -10,6 +10,7 @@ Example:
 
 import argparse
 import pickle
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -72,14 +73,17 @@ def _decode_jpg(data) -> np.ndarray | None:
     return image.astype(np.uint8, copy=False)
 
 
-def _collect_input_files(paths: list[Path]) -> list[Path]:
+def _collect_input_files(paths: list[Path], recursive: bool = True) -> list[Path]:
     files = []
     for path in paths:
         if path.is_dir():
-            files.extend(sorted(path.glob("teleop_log_*.pkl")))
-        else:
+            if recursive:
+                files.extend(path.rglob("teleop_log_*.pkl"))
+            else:
+                files.extend(path.glob("teleop_log_*.pkl"))
+        elif path.is_file():
             files.append(path)
-    return files
+    return sorted(set(files), key=lambda f: (str(f.parent), f.name))
 
 
 def _find_first_image(data_by_episode: list[list[dict]], include_depth: bool):
@@ -139,9 +143,35 @@ def _build_features(data_by_episode: list[list[dict]], include_depth: bool) -> d
     return features
 
 
+def _build_image_defaults(data_by_episode: list[list[dict]], include_depth: bool) -> dict[str, np.ndarray]:
+    """Build fallback images so every frame has every declared image feature."""
+    defaults = {}
+    streams = ("color", "depth") if include_depth else ("color",)
+    for episode in data_by_episode:
+        for entry in episode:
+            images = entry.get("image")
+            if not isinstance(images, dict):
+                continue
+            for camera_name, camera_data in images.items():
+                if not isinstance(camera_data, dict):
+                    continue
+                for stream in streams:
+                    key = (
+                        f"observation.images.{camera_name}"
+                        if stream == "color"
+                        else f"observation.images.{camera_name}.{stream}"
+                    )
+                    if key in defaults:
+                        continue
+                    image = _decode_jpg(camera_data.get(stream))
+                    if image is not None:
+                        defaults[key] = image
+    return defaults
+
+
 def _create_dataset(args, features: dict):
     try:
-        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
     except ImportError as exc:
         raise ImportError(
             "未安装 lerobot。请先在当前环境安装，例如：pip install lerobot"
@@ -171,7 +201,17 @@ def _add_frame(dataset, frame: dict):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("inputs", nargs="+", type=Path, help="Pickle files or directories containing teleop_log_*.pkl")
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        type=Path,
+        help="Pickle files or directories (recursive scan for teleop_log_*.pkl; use logs/ to merge subfolders).",
+    )
+    parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Only read teleop_log_*.pkl in the top level of each input directory.",
+    )
     parser.add_argument("--root", type=Path, default=Path("data/lerobot/tb6r5"), help="Output dataset root")
     parser.add_argument("--repo-id", default="local/tb6r5", help="LeRobot repo_id")
     parser.add_argument("--fps", type=int, default=50)
@@ -179,19 +219,28 @@ def main():
     parser.add_argument("--robot-type", default="tb6r5")
     parser.add_argument("--include-depth", action="store_true", help="Also export depth JPGs as image observations")
     parser.add_argument("--no-videos", action="store_true", help="Store image files instead of LeRobot videos if supported")
+    parser.add_argument("--overwrite", action="store_true", help="Delete output root if it already exists")
     args = parser.parse_args()
 
-    files = _collect_input_files(args.inputs)
+    files = _collect_input_files(args.inputs, recursive=not args.no_recursive)
     if not files:
         raise FileNotFoundError("No input pickle files found.")
+    print(f"Found {len(files)} episode file(s) under {len({f.parent for f in files})} folder(s).")
 
     data_by_episode = [_load_pickle(path) for path in files]
     data_by_episode = [episode for episode in data_by_episode if episode]
     if not data_by_episode:
         raise ValueError("Input logs contain no frames.")
 
+    if args.root.exists():
+        if not args.overwrite:
+            raise FileExistsError(f"{args.root} already exists. Use --overwrite or choose another --root path.")
+        shutil.rmtree(args.root)
+
     features = _build_features(data_by_episode, args.include_depth)
+    image_defaults = _build_image_defaults(data_by_episode, args.include_depth)
     dataset = _create_dataset(args, features)
+    image_feature_keys = [key for key, spec in features.items() if spec.get("dtype") == "image"]
 
     streams = ("color", "depth") if args.include_depth else ("color",)
     total_frames = 0
@@ -217,6 +266,11 @@ def main():
                         else f"observation.images.{camera_name}.{stream}"
                     )
                     frame[key] = image
+
+            for key in image_feature_keys:
+                if key not in frame:
+                    # Some entries miss a camera stream; use the first valid frame from that stream.
+                    frame[key] = image_defaults[key]
 
             _add_frame(dataset, frame)
             total_frames += 1
