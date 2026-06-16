@@ -9,7 +9,8 @@ Usage:
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --jog-any-c-orientation-only
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --jog-any-c-interrupt on
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode placo_ik --zone-ratio 0.05
-    # A: {Stop} + home; axis click toggles gripper stream; axisX/Y -> distance in [0, gripper_max_d] (default 12)
+    # right_grip: move arm; right_trigger: gripper (--require-joystick-arm enables right_axis_click gate)
+    # A: discard + home; B: toggle logging
     python scripts/hardware/teleop_tb6r5_hardware.py --scale-factor 2.0 --cartesian-max-step-pos-m 0.05
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --cartesian-vel 1.0 --cartesian-acc 1.0 --cartesian-dec 1.0
     python scripts/hardware/teleop_tb6r5_hardware.py --jog-any-c-preview
@@ -51,14 +52,11 @@ from xrobotoolkit_teleop.hardware.tb6r5_teleop_controller import (
     DEFAULT_ZONE_RATIO,
     DEFAULT_LOG_JOINT_COUNT,
     DEFAULT_GRIPPER_TRIGGER_NAME,
-    DEFAULT_GRIPPER_TRIGGER_THRESHOLD,
-    DEFAULT_GRIPPER_OPEN_CMD,
-    DEFAULT_GRIPPER_CLOSED_CMD,
     DEFAULT_GRIPPER_OBSERVATION,
-    DEFAULT_JOYSTICK_CONTROLLER,
-    DEFAULT_JOYSTICK_AXIS_CLICK,
     DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
     DEFAULT_GRIPPER_MAX_D,
+    DEFAULT_SUBLOOP1_IMMEDIATE,
+    DEFAULT_TELEOP_ARM_BUTTON,
     DEFAULT_REALSENSE_SERIAL_DICT,
     JogAnyCInterruptMode,
 )
@@ -83,6 +81,7 @@ def main(
     joint_vel: float = DEFAULT_JOG_ANY_JOINT_VEL,
     joint_acc: float = DEFAULT_JOG_ANY_JOINT_ACC,
     joint_dec: float = DEFAULT_JOG_ANY_JOINT_DEC,
+    sl_immediate: bool = DEFAULT_SUBLOOP1_IMMEDIATE,
     safe_tcp_z_min_m: float | None = DEFAULT_SAFE_TCP_Z_MIN_M,
     safe_tcp_z_max_m: float | None = DEFAULT_SAFE_TCP_Z_MAX_M,
     print_ik_tcp_pose: bool = DEFAULT_PRINT_IK_TCP_POSE,
@@ -100,6 +99,7 @@ def main(
     lerobot_image_writer_processes: int = 0,
     lerobot_image_writer_threads: int = 4,
     lerobot_encoder_threads: int = 2,
+    lerobot_include_depth: bool = False,
     log_dir: str = "logs/tb6r5",
     log_freq: float = 50,
     enable_camera: bool = True,
@@ -112,15 +112,13 @@ def main(
     camera_jpg_quality: int = 85,
     log_joint_count: int = DEFAULT_LOG_JOINT_COUNT,
     gripper_trigger_name: str = DEFAULT_GRIPPER_TRIGGER_NAME,
-    gripper_trigger_threshold: float = DEFAULT_GRIPPER_TRIGGER_THRESHOLD,
-    gripper_open_cmd: float = DEFAULT_GRIPPER_OPEN_CMD,
-    gripper_closed_cmd: float = DEFAULT_GRIPPER_CLOSED_CMD,
     gripper_observation_default: float = DEFAULT_GRIPPER_OBSERVATION,
-    joystick_controller: str = DEFAULT_JOYSTICK_CONTROLLER,
-    joystick_axis_click: str = DEFAULT_JOYSTICK_AXIS_CLICK,
     gripper_max_d: float = DEFAULT_GRIPPER_MAX_D,
     two_fingers_gripper_interval: float = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
     disable_gripper: bool = False,
+    require_grip_to_send_commands: bool = True,
+    require_joystick_arm: bool = False,
+    teleop_arm_button: str = DEFAULT_TELEOP_ARM_BUTTON,
     teleop_mode: TeleopMode = DEFAULT_TELEOP_MODE,
     jog_any_c_preview: bool = False,
 ):
@@ -151,6 +149,7 @@ def main(
         joint_vel=joint_vel,
         joint_acc=joint_acc,
         joint_dec=joint_dec,
+        subloop1_immediate=sl_immediate,
         safe_tcp_z_min_m=safe_tcp_z_min_m,
         safe_tcp_z_max_m=safe_tcp_z_max_m,
         print_ik_tcp_pose=print_ik_tcp_pose,
@@ -169,6 +168,7 @@ def main(
         lerobot_image_writer_processes=lerobot_image_writer_processes,
         lerobot_image_writer_threads=lerobot_image_writer_threads,
         lerobot_encoder_threads=lerobot_encoder_threads,
+        lerobot_include_depth=lerobot_include_depth,
         log_dir=log_dir,
         log_freq=log_freq,
         enable_camera=enable_camera,
@@ -181,15 +181,13 @@ def main(
         camera_jpg_quality=camera_jpg_quality,
         log_joint_count=log_joint_count,
         gripper_trigger_name=gripper_trigger_name,
-        gripper_trigger_threshold=gripper_trigger_threshold,
-        gripper_open_cmd=gripper_open_cmd,
-        gripper_closed_cmd=gripper_closed_cmd,
         gripper_observation_default=gripper_observation_default,
-        joystick_controller=joystick_controller,
-        joystick_axis_click=joystick_axis_click,
         gripper_max_d=gripper_max_d,
         two_fingers_gripper_interval=two_fingers_gripper_interval,
         disable_gripper=disable_gripper,
+        require_grip_to_send_commands=require_grip_to_send_commands,
+        require_joystick_arm=require_joystick_arm,
+        teleop_arm_button=teleop_arm_button,
     )
     controller.run()
 

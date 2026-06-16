@@ -10,18 +10,15 @@ This script follows the official LeRobot inference flow:
   - send command to TB6-R5
 
 Observation / action layout (must match the training dataset):
-  - observation.state : [q0..q5, gripper_state]  (7-D)
+  - observation.state : [q0..q5, gripper_mm]  (7-D)
       * the 6 arm joints are read from the robot (rad)
-      * gripper_state is a CONSTANT during data collection
-        (DEFAULT_GRIPPER_OBSERVATION = 0.0), so we feed the same constant here
+      * gripper_mm is actual_pos feedback from TwoFingersGripperSerialYS (mm, 0=closed, max=open)
   - observation.images.realsense_0 / realsense_1 : RGB HWC uint8 (480x640x3)
-  - action : [q0..q5, gripper_norm]  (7-D)
-      * action[6] is a normalized gripper command in [0, 1]
-      * training labels are binary-ish: open≈0, close≈1 (full close = gripper_max_distance)
-      * gripper asymmetric hysteresis: open→close when norm > close_norm (default 0.1),
-        close→open when norm < open_norm (default 0.5); edge RPC min interval = fps * seconds in control steps
+  - action : [q0..q5, gripper_mm]  (7-D)
+      * action[6] is commanded gripper distance in mm (0=closed, gripper_max_distance=open)
+      * deployed via SubLoop1: JogAnyJ + MoveTwoFingersGripper in one RPC
 
-On start and Ctrl+C exit the arm moves to --home-joint-deg (teleop default) via MoveAbsJ.
+On start and Ctrl+C exit the arm moves to --home-joint-deg via SubLoop1 (MoveAbsJ + open gripper).
 
 Use --dry-run first to validate outputs before sending commands to the robot.
 """
@@ -47,8 +44,8 @@ DEFAULT_REALSENSE_SERIAL_DICT = {
     "realsense_0": "135522071053",
     "realsense_1": "327122073649",
 }
-# observation.state[6] is logged as a constant (DEFAULT_GRIPPER_OBSERVATION).
-DEFAULT_GRIPPER_OBSERVATION = 0.0
+# Fallback when gripper feedback is unavailable.
+DEFAULT_GRIPPER_OBSERVATION_MM = 0.0
 # Same as tb6r5_teleop_controller.DEFAULT_HOME_JOINT_DEG (degrees).
 DEFAULT_HOME_JOINT_DEG = (15.0, -100.0, 90.0, -80.0, -90.0, -45.0)
 DEFAULT_HOME_SETTLE_TIME_S = 3.0
@@ -81,35 +78,47 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=float, default=20.0, help="Control loop frequency")
     parser.add_argument("--joint-step-max-rad", type=float, default=0.03, help="Per-step joint delta clamp (rad)")
     parser.add_argument(
-        "--gripper-observation",
+        "--gripper-observation-constant",
         type=float,
-        default=DEFAULT_GRIPPER_OBSERVATION,
-        help="Constant value fed to observation.state[6] (must match data collection, default 0.0)",
+        default=None,
+        help="Force constant mm value for observation.state[6] (default: read actual_pos feedback).",
     )
     parser.add_argument(
         "--gripper-max-distance",
         type=float,
         default=DEFAULT_GRIPPER_MAX_D,
-        help="Gripper max distance in mm (must match data collection, default 12)",
+        help="Gripper max open distance in mm (must match data collection, default 70)",
     )
-    parser.add_argument("--gripper-interval", type=float, default=25.0, help="MoveTwoFingersGripper interval")
+    parser.add_argument("--gripper-interval", type=float, default=5.0, help="MoveTwoFingersGripper interval")
+    parser.add_argument(
+        "--gripper-cmd-delta",
+        type=float,
+        default=0.5,
+        help="Minimum gripper distance change (mm) before re-sending SubLoop1 RPC.",
+    )
+    parser.add_argument(
+        "--gripper-continuous",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Map action[6] directly to mm distance (default). Use --no-gripper-continuous for legacy hysteresis.",
+    )
     parser.add_argument(
         "--gripper-close-norm",
         type=float,
         default=0.1,
-        help="Open→close: when held open, close when action[6] > this value (default 0.1).",
+        help="Legacy hysteresis: open→close when norm > this (only with --no-gripper-continuous).",
     )
     parser.add_argument(
         "--gripper-open-norm",
         type=float,
         default=0.5,
-        help="Close→open: when held closed, open when action[6] < this value (default 0.5).",
+        help="Legacy hysteresis: close→open when norm < this (only with --no-gripper-continuous).",
     )
     parser.add_argument(
         "--gripper-edge-min-interval",
         type=float,
         default=2.0,
-        help="Minimum seconds between gripper RPCs on state edges; converted to control steps via --fps.",
+        help="Legacy hysteresis: min seconds between gripper RPC edges.",
     )
     parser.add_argument(
         "--n-action-steps",
@@ -226,26 +235,37 @@ def _go_home(
     home_q = np.deg2rad(np.asarray(home_joint_deg, dtype=float))
     print(f"[ACT] Homing to {tuple(home_joint_deg)} deg ...")
     print(
-        f"{_BOLD_GREEN}[ACT][GRIPPER] 复位：下发 MoveTwoFingersGripper(distance=0, "
+        f"{_BOLD_GREEN}[ACT][GRIPPER] 复位：SubLoop1 MoveAbsJ + "
+        f"MoveTwoFingersGripper(distance={gripper_max_distance:.1f}mm, "
         f"interval={gripper_interval:.1f}){_RESET}"
     )
-    arm.move_two_fingers_gripper(
-        distance=0.0,
+    arm.go_home(
+        home_q,
+        gripper_distance=gripper_max_distance,
         interval=gripper_interval,
         max_distance=gripper_max_distance,
     )
-    arm.go_home(home_q)
     if settle_time_s > 0:
         time.sleep(settle_time_s)
     print("[ACT] Homing done.")
 
 
-def _gripper_state_label(gripper_norm: float) -> str:
-    if gripper_norm <= 0.05:
-        return "张开"
-    if gripper_norm >= 0.95:
+def _gripper_state_label_mm(distance_mm: float, max_distance: float) -> str:
+    if distance_mm <= max_distance * 0.05:
         return "闭合"
+    if distance_mm >= max_distance * 0.95:
+        return "张开"
     return "中间"
+
+
+def _resolve_gripper_observation_mm(arm: TB6R5Interface | None, constant_mm: float | None) -> float:
+    if constant_mm is not None:
+        return float(constant_mm)
+    if arm is not None:
+        feedback = arm.get_gripper_distance_mm()
+        if feedback is not None:
+            return float(feedback)
+    return DEFAULT_GRIPPER_OBSERVATION_MM
 
 
 def _gripper_desired_closed(
@@ -334,78 +354,53 @@ def _act_chunk_info(policy) -> tuple[int | None, int | None]:
 
 def _print_gripper_status(
     *,
-    gripper_raw: float,
-    gripper_norm: float,
-    desired_closed: bool,
-    held_closed: bool | None,
-    gripper_cmd_dist: float | None,
-    send_gripper: bool,
-    gripper_edge_pending: bool,
-    gripper_rate_limited: bool,
-    gripper_close_norm: float,
-    gripper_open_norm: float,
-    gripper_edge_min_steps: int,
-    gripper_steps_since_rpc: int,
+    gripper_raw_mm: float,
+    gripper_cmd_mm: float,
+    gripper_obs_mm: float,
+    sent: bool,
     gripper_max_distance: float,
     gripper_interval: float,
     chunk_step: int | None,
     chunk_size: int | None,
+    legacy_mode: bool = False,
+    desired_closed: bool | None = None,
+    send_gripper: bool = False,
 ) -> None:
-    state = _gripper_state_label(gripper_norm)
-    held_label = "?" if held_closed is None else ("闭合" if held_closed else "张开")
-    if send_gripper and gripper_cmd_dist is not None:
-        dist_label = "MAX" if gripper_cmd_dist >= gripper_max_distance - 1e-6 else "OPEN"
-        cmd_status = (
-            f"边沿触发 → 下发 MoveTwoFingersGripper(distance={gripper_cmd_dist:.2f}={dist_label}, "
-            f"interval={gripper_interval:.1f})"
-        )
-    elif gripper_edge_pending and gripper_rate_limited:
-        steps_left = max(gripper_edge_min_steps - gripper_steps_since_rpc, 0)
-        cmd_status = (
-            f"跳变待下发（距上次 RPC 仅 {gripper_steps_since_rpc}/{gripper_edge_min_steps} 步，"
-            f"还需 {steps_left} 步），保持当前状态，跳过夹爪 RPC"
-        )
+    state = _gripper_state_label_mm(gripper_cmd_mm, gripper_max_distance)
+    if legacy_mode:
+        cmd_status = f"legacy hysteresis send={send_gripper}"
+    elif sent:
+        cmd_status = f"SubLoop1 distance={gripper_cmd_mm:.2f}mm interval={gripper_interval:.1f}"
     else:
-        cmd_status = f"保持 {held_label}，无跳变，跳过夹爪 RPC"
+        cmd_status = "throttled, no SubLoop1 this step"
     chunk_info = ""
     if chunk_step is not None and chunk_size is not None:
         chunk_info = f" chunk={chunk_step + 1}/{chunk_size}"
     line = (
-        f"[ACT][GRIPPER] raw={gripper_raw:.4f} norm={gripper_norm:.4f} "
-        f"desired={'闭合' if desired_closed else '张开'} held={held_label} "
-        f"send={send_gripper}{chunk_info} | {cmd_status}"
+        f"[ACT][GRIPPER] raw={gripper_raw_mm:.2f}mm cmd={gripper_cmd_mm:.2f}mm "
+        f"obs={gripper_obs_mm:.2f}mm state={state} sent={sent}{chunk_info} | {cmd_status}"
     )
-    if send_gripper or gripper_edge_pending:
-        color = _BOLD_RED if desired_closed else _BOLD_GREEN
-    else:
-        color = ""
-    print(f"{color}{line}{_RESET}" if color else line)
+    print(line)
 
 
 def _print_gripper_config(
     gripper_max_distance: float,
-    gripper_close_norm: float,
-    gripper_open_norm: float,
-    gripper_edge_min_interval: float,
-    gripper_edge_min_steps: int,
-    fps: float,
     gripper_interval: float,
-    gripper_observation: float,
+    gripper_cmd_delta: float,
+    gripper_continuous: bool,
     chunk_size: int | None,
     n_action_steps: int | None,
     temporal_ensemble_coeff: float | None,
     refresh_policy_every_step: bool,
 ) -> None:
+    mode = "continuous mm + SubLoop1" if gripper_continuous else "legacy hysteresis"
     print(
         f"{_RED}[ACT][GRIPPER] 配置: max_dist={gripper_max_distance:.1f}mm "
-        f"close_norm={gripper_close_norm:.2f} open_norm={gripper_open_norm:.2f} "
-        f"edge_min={gripper_edge_min_interval:.1f}s={gripper_edge_min_steps}步@{fps:.0f}Hz "
-        f"interval={gripper_interval:.1f} obs_state={gripper_observation:.1f}{_RESET}"
+        f"interval={gripper_interval:.1f} cmd_delta={gripper_cmd_delta:.2f}mm mode={mode}{_RESET}"
     )
     print(
-        f"{_RED}[ACT][GRIPPER] 不对称迟滞：张开→闭合 norm>{gripper_close_norm:.2f}，"
-        f"闭合→张开 norm<{gripper_open_norm:.2f}，中间保持；"
-        f"跳变 RPC 至少间隔 {gripper_edge_min_steps} 个控制步。{_RESET}"
+        f"{_RED}[ACT][GRIPPER] action[6]/state[6] 单位为 mm（0=闭合，{gripper_max_distance:.0f}=张开）；"
+        f"obs 优先读 actual_pos 反馈。{_RESET}"
     )
     if temporal_ensemble_coeff is not None:
         print(
@@ -551,17 +546,18 @@ def main() -> int:
         raise ValueError("--fps must be > 0")
     if args.gripper_max_distance <= 0:
         raise ValueError("--gripper-max-distance must be > 0")
-    if not 0.0 <= args.gripper_close_norm <= 1.0:
-        raise ValueError("--gripper-close-norm must be in [0, 1]")
-    if not 0.0 <= args.gripper_open_norm <= 1.0:
-        raise ValueError("--gripper-open-norm must be in [0, 1]")
-    if args.gripper_close_norm >= args.gripper_open_norm:
-        raise ValueError(
-            f"--gripper-close-norm ({args.gripper_close_norm}) must be < "
-            f"--gripper-open-norm ({args.gripper_open_norm}) for asymmetric hysteresis"
-        )
-    if args.gripper_edge_min_interval < 0:
-        raise ValueError("--gripper-edge-min-interval must be >= 0")
+    if not args.gripper_continuous:
+        if not 0.0 <= args.gripper_close_norm <= 1.0:
+            raise ValueError("--gripper-close-norm must be in [0, 1]")
+        if not 0.0 <= args.gripper_open_norm <= 1.0:
+            raise ValueError("--gripper-open-norm must be in [0, 1]")
+        if args.gripper_close_norm >= args.gripper_open_norm:
+            raise ValueError(
+                f"--gripper-close-norm ({args.gripper_close_norm}) must be < "
+                f"--gripper-open-norm ({args.gripper_open_norm}) for asymmetric hysteresis"
+            )
+        if args.gripper_edge_min_interval < 0:
+            raise ValueError("--gripper-edge-min-interval must be >= 0")
 
     policy, preprocessor, postprocessor = _load_policy_components(
         policy_path=args.policy_path,
@@ -617,13 +613,9 @@ def main() -> int:
     n_action_steps = getattr(policy.config, "n_action_steps", None)
     _print_gripper_config(
         args.gripper_max_distance,
-        args.gripper_close_norm,
-        args.gripper_open_norm,
-        args.gripper_edge_min_interval,
-        gripper_edge_min_steps,
-        args.fps,
         args.gripper_interval,
-        args.gripper_observation,
+        args.gripper_cmd_delta,
+        args.gripper_continuous,
         chunk_size,
         n_action_steps,
         args.temporal_ensemble_coeff,
@@ -641,9 +633,10 @@ def main() -> int:
             else:
                 q_current = np.zeros(6, dtype=np.float32)
 
+            gripper_obs_mm = _resolve_gripper_observation_mm(arm, args.gripper_observation_constant)
             observation = {
                 "observation.state": np.concatenate(
-                    [q_current, np.array([args.gripper_observation], dtype=np.float32)],
+                    [q_current, np.array([gripper_obs_mm], dtype=np.float32)],
                     axis=0,
                 )
             }
@@ -678,32 +671,32 @@ def main() -> int:
             q_target = action[:6]
             q_cmd = _clamp_joint_step(q_target, q_current, args.joint_step_max_rad)
 
-            # postprocessor 已反归一化：action[:6]=关节角(rad)，action[6]=夹爪归一化指令[0,1]
-            gripper_raw = float(action[6])
-            gripper_norm = float(np.clip(gripper_raw, 0.0, 1.0))
-
+            gripper_raw_mm = float(action[6])
             now = time.time()
-            desired_closed = _gripper_desired_closed(
-                gripper_norm,
-                held_gripper_closed,
-                args.gripper_close_norm,
-                args.gripper_open_norm,
-            )
-            gripper_edge = held_gripper_closed is None or desired_closed != held_gripper_closed
-            gripper_edge_pending = gripper_edge
-            gripper_rate_limited = False
+            sent = False
+            gripper_cmd_mm = float(np.clip(gripper_raw_mm, 0.0, args.gripper_max_distance))
             send_gripper = False
             gripper_cmd_dist: float | None = None
-            gripper_steps_since_rpc = control_step - last_gripper_rpc_step
-            if gripper_edge:
-                gripper_cmd_dist = float(args.gripper_max_distance) if desired_closed else 0.0
-                if gripper_steps_since_rpc >= gripper_edge_min_steps:
-                    send_gripper = True
-                    held_gripper_closed = desired_closed
-                    last_gripper_rpc_step = control_step
-                    gripper_steps_since_rpc = 0
-                else:
-                    gripper_rate_limited = True
+
+            if args.gripper_continuous:
+                gripper_cmd_dist = gripper_cmd_mm
+            else:
+                gripper_norm = gripper_cmd_mm / args.gripper_max_distance
+                desired_closed = _gripper_desired_closed(
+                    gripper_norm,
+                    held_gripper_closed,
+                    args.gripper_close_norm,
+                    args.gripper_open_norm,
+                )
+                gripper_edge = held_gripper_closed is None or desired_closed != held_gripper_closed
+                gripper_steps_since_rpc = control_step - last_gripper_rpc_step
+                if gripper_edge:
+                    gripper_cmd_dist = float(args.gripper_max_distance) if desired_closed else 0.0
+                    if gripper_steps_since_rpc >= gripper_edge_min_steps:
+                        send_gripper = True
+                        held_gripper_closed = desired_closed
+                        last_gripper_rpc_step = control_step
+
             chunk_step, chunk_size = _act_chunk_info(policy)
 
             if now - last_print >= args.print_every:
@@ -714,33 +707,38 @@ def main() -> int:
                     f"q_cmd={np.round(q_cmd, 3)}"
                 )
                 _print_gripper_status(
-                    gripper_raw=gripper_raw,
-                    gripper_norm=gripper_norm,
-                    desired_closed=desired_closed,
-                    held_closed=held_gripper_closed,
-                    gripper_cmd_dist=gripper_cmd_dist,
-                    send_gripper=send_gripper,
-                    gripper_edge_pending=gripper_edge_pending,
-                    gripper_rate_limited=gripper_rate_limited,
-                    gripper_close_norm=args.gripper_close_norm,
-                    gripper_open_norm=args.gripper_open_norm,
-                    gripper_edge_min_steps=gripper_edge_min_steps,
-                    gripper_steps_since_rpc=gripper_steps_since_rpc,
+                    gripper_raw_mm=gripper_raw_mm,
+                    gripper_cmd_mm=gripper_cmd_dist if gripper_cmd_dist is not None else gripper_cmd_mm,
+                    gripper_obs_mm=gripper_obs_mm,
+                    sent=sent,
                     gripper_max_distance=args.gripper_max_distance,
                     gripper_interval=args.gripper_interval,
                     chunk_step=chunk_step,
                     chunk_size=chunk_size,
+                    legacy_mode=not args.gripper_continuous,
+                    desired_closed=held_gripper_closed if not args.gripper_continuous else None,
+                    send_gripper=send_gripper,
                 )
                 last_print = now
 
             if arm is not None:
-                arm.set_joint_positions(q_cmd, force=True)
-                if send_gripper and gripper_cmd_dist is not None:
-                    arm.move_two_fingers_gripper(
-                        distance=gripper_cmd_dist,
+                if args.gripper_continuous:
+                    sent = arm.set_joint_positions_with_gripper(
+                        q_cmd,
+                        gripper_cmd_mm,
+                        force=True,
                         interval=args.gripper_interval,
                         max_distance=args.gripper_max_distance,
+                        cmd_delta=args.gripper_cmd_delta,
                     )
+                else:
+                    arm.set_joint_positions(q_cmd, force=True)
+                    if send_gripper and gripper_cmd_dist is not None:
+                        sent = arm.move_two_fingers_gripper(
+                            distance=gripper_cmd_dist,
+                            interval=args.gripper_interval,
+                            max_distance=args.gripper_max_distance,
+                        )
 
             elapsed = time.time() - start_t
             if elapsed < dt:

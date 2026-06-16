@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_tb6r5"
+version = "0.1.0"
+description = "LeRobot robot plugin for TB6-R5 (6-DOF arm + YS gripper)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "lerobot>=0.4.0",
+    "numpy",
+    "xrobotoolkit_teleop",
+]
+
+[project.urls]
+Homepage = "https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Python"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lerobot_robot_tb6r5*"]

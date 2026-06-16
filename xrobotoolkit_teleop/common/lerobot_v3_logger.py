@@ -54,17 +54,20 @@ def build_tb6r5_lerobot_features(
     use_videos: bool = True,
     include_depth: bool = False,
 ) -> dict:
+    """Feature schema aligned with ``lerobot_record`` / ``convert_tb6r5_pkl_to_lerobot_v3``."""
     vision_dtype = "image" if not use_videos else "video"
+    state_names = [f"state_{i}" for i in range(state_dim)]
+    action_names = [f"action_{i}" for i in range(action_dim)]
     features = {
         "observation.state": {
             "dtype": "float32",
             "shape": (state_dim,),
-            "names": [f"state_{i}" for i in range(state_dim)],
+            "names": state_names,
         },
         "action": {
             "dtype": "float32",
             "shape": (action_dim,),
-            "names": [f"action_{i}" for i in range(action_dim)],
+            "names": action_names,
         },
     }
     for cam in camera_names:
@@ -115,6 +118,7 @@ class TB6LeRobotV3Logger:
         self.camera_names = list(camera_names or [])
         self.include_depth = include_depth
         self._last_color: Dict[str, np.ndarray] = {}
+        self._last_depth: Dict[str, np.ndarray] = {}
         self._black: Optional[np.ndarray] = None
 
         if self.root.exists():
@@ -181,6 +185,8 @@ class TB6LeRobotV3Logger:
             h, w = image_height, image_width
             self._black = np.zeros((h, w, 3), dtype=np.uint8)
             self._last_color = {cam: self._black.copy() for cam in self.camera_names}
+            if include_depth:
+                self._last_depth = {cam: self._black.copy() for cam in self.camera_names}
 
         if not streaming_encoding:
             print(
@@ -208,20 +214,20 @@ class TB6LeRobotV3Logger:
                     self._last_color[cam] = color
                 frame[f"observation.images.{cam}"] = self._last_color.get(cam, self._black)
 
-                if self.include_depth and isinstance(cam_data, dict):
-                    depth = cam_data.get("depth")
-                    if isinstance(depth, bytes):
-                        depth_img = _rgb_uint8_hwc(decompress_jpg_to_image(depth))
-                    else:
-                        depth_img = _rgb_uint8_hwc(depth)
+                if self.include_depth:
+                    depth_img = None
+                    if isinstance(cam_data, dict):
+                        depth = cam_data.get("depth")
+                        if isinstance(depth, bytes):
+                            depth_img = _rgb_uint8_hwc(decompress_jpg_to_image(depth))
+                        elif depth is not None:
+                            depth_img = _rgb_uint8_hwc(depth)
                     if depth_img is not None:
-                        frame[f"observation.images.{cam}.depth"] = depth_img
+                        self._last_depth[cam] = depth_img
+                    frame[f"observation.images.{cam}.depth"] = self._last_depth.get(cam, self._black)
 
-        try:
-            self.dataset.add_frame(frame, task=self.task)
-        except TypeError:
-            frame["task"] = self.task
-            self.dataset.add_frame(frame)
+        frame["task"] = self.task
+        self.dataset.add_frame(frame)
 
     def save_episode(self) -> int:
         """Flush current buffer to disk (parquet + videos). Returns episode length."""

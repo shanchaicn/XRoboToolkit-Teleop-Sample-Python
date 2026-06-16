@@ -16,6 +16,7 @@ from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
     DEFAULT_JOG_ANY_JOINT_ACC,
     DEFAULT_JOG_ANY_JOINT_DEC,
     DEFAULT_JOG_ANY_JOINT_VEL,
+    DEFAULT_SUBLOOP1_IMMEDIATE,
     DEFAULT_TELEOP_MODE,
     DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
     DEFAULT_GRIPPER_MAX_D,
@@ -45,13 +46,13 @@ DEFAULT_HOME_JOINT_DEG = (15.0, -100.0, 90.0, -80.0, -90.0, -45.0)
 DEFAULT_PLACO_JOINT_VMAX_RAD_S = 3.14
 DEFAULT_LOG_JOINT_COUNT = 6 # 6 Joints in the URDF
 DEFAULT_GRIPPER_TRIGGER_NAME = "right_trigger"
-DEFAULT_GRIPPER_TRIGGER_THRESHOLD = 0.5
-DEFAULT_GRIPPER_OPEN_CMD = 0.0
-DEFAULT_GRIPPER_CLOSED_CMD = 1.0
+DEFAULT_TELEOP_ARM_BUTTON = "right_axis_click"
+DEFAULT_GRIPPER_OPEN_DISTANCE_MM = 70.0
+DEFAULT_GRIPPER_CLOSED_DISTANCE_MM = 0.0
 DEFAULT_GRIPPER_OBSERVATION = 0.0
-DEFAULT_JOYSTICK_CONTROLLER = "right"
-DEFAULT_JOYSTICK_AXIS_CLICK = "right_axis_click"
 DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA = 0.5
+DEFAULT_ARM_RPC_RATE_HZ = 50.0
+DEFAULT_GRIPPER_RPC_RATE_HZ = 2.0
 DEFAULT_REALSENSE_SERIAL_DICT = {
     "realsense_0": "135522071053",
     "realsense_1": "327122073649",
@@ -72,7 +73,6 @@ DEFAULT_JOG_ANY_C_INTERRUPT: JogAnyCInterruptMode = "off"
 CARTESIAN_WARMUP_FRAMES = 0
 CARTESIAN_MIN_START_DELTA_M = 0.001
 CARTESIAN_MIN_START_DELTA_ROT_RAD = 0.01
-HOME_SETTLE_TIME_S = 3.0
 GRIP_ACTIVE_THRESHOLD = 0.5
 # World-frame direction for "tool Z points down" in jog_any_c position-only mode
 WORLD_DOWN = np.array([0.0, 0.0, -1.0])
@@ -117,6 +117,8 @@ class TB6R5TeleopController(HardwareTeleopController):
         scale_factor: float = DEFAULT_SCALE_FACTOR,
         visualize_placo: bool = False,
         control_rate_hz: int = 50,
+        arm_rpc_rate_hz: float = DEFAULT_ARM_RPC_RATE_HZ,
+        gripper_rpc_rate_hz: float = DEFAULT_GRIPPER_RPC_RATE_HZ,
         enable_log_data: bool = True,
         log_dir: str = "logs/tb6r5",
         log_freq: float = 50,
@@ -130,12 +132,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         camera_jpg_quality: int = 85,
         log_joint_count: int = DEFAULT_LOG_JOINT_COUNT,
         gripper_trigger_name: str = DEFAULT_GRIPPER_TRIGGER_NAME,
-        gripper_trigger_threshold: float = DEFAULT_GRIPPER_TRIGGER_THRESHOLD,
-        gripper_open_cmd: float = DEFAULT_GRIPPER_OPEN_CMD,
-        gripper_closed_cmd: float = DEFAULT_GRIPPER_CLOSED_CMD,
         gripper_observation_default: float = DEFAULT_GRIPPER_OBSERVATION,
-        joystick_controller: str = DEFAULT_JOYSTICK_CONTROLLER,
-        joystick_axis_click: str = DEFAULT_JOYSTICK_AXIS_CLICK,
         gripper_max_d: float = DEFAULT_GRIPPER_MAX_D,
         two_fingers_gripper_interval: float = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
         two_fingers_gripper_cmd_delta: float = DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA,
@@ -154,6 +151,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         joint_vel: float = DEFAULT_JOG_ANY_JOINT_VEL,
         joint_acc: float = DEFAULT_JOG_ANY_JOINT_ACC,
         joint_dec: float = DEFAULT_JOG_ANY_JOINT_DEC,
+        subloop1_immediate: bool = DEFAULT_SUBLOOP1_IMMEDIATE,
         safe_tcp_z_min_m: Optional[float] = DEFAULT_SAFE_TCP_Z_MIN_M,
         safe_tcp_z_max_m: Optional[float] = DEFAULT_SAFE_TCP_Z_MAX_M,
         print_ik_tcp_pose: bool = DEFAULT_PRINT_IK_TCP_POSE,
@@ -168,7 +166,11 @@ class TB6R5TeleopController(HardwareTeleopController):
         lerobot_image_writer_processes: int = 0,
         lerobot_image_writer_threads: int = 4,
         lerobot_encoder_threads: int = 2,
+        lerobot_include_depth: bool = False,
         jog_any_c_preview_only: bool = False,
+        require_grip_to_send_commands: bool = True,
+        require_joystick_arm: bool = False,
+        teleop_arm_button: str = DEFAULT_TELEOP_ARM_BUTTON,
     ):
         self.robot_ip = robot_ip
         self.rpc_port = rpc_port
@@ -191,6 +193,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         self.joint_vel = float(joint_vel)
         self.joint_acc = float(joint_acc)
         self.joint_dec = float(joint_dec)
+        self.subloop1_immediate = bool(subloop1_immediate)
         self.safe_tcp_z_min_m = safe_tcp_z_min_m if safe_tcp_z_min_m is None else float(safe_tcp_z_min_m)
         self.safe_tcp_z_max_m = safe_tcp_z_max_m if safe_tcp_z_max_m is None else float(safe_tcp_z_max_m)
         if (
@@ -211,28 +214,27 @@ class TB6R5TeleopController(HardwareTeleopController):
         self.lerobot_image_writer_processes = int(lerobot_image_writer_processes)
         self.lerobot_image_writer_threads = int(lerobot_image_writer_threads)
         self.lerobot_encoder_threads = int(lerobot_encoder_threads)
+        self.lerobot_include_depth = bool(lerobot_include_depth)
         self.lerobot_logger: Optional[TB6LeRobotV3Logger] = None
         self.enable_camera = enable_camera
         self.control_rate_hz = control_rate_hz
+        self.arm_rpc_rate_hz = max(float(arm_rpc_rate_hz), 0.1)
+        self.gripper_rpc_rate_hz = max(float(gripper_rpc_rate_hz), 0.1)
+        self._arm_rpc_stride = max(1, round(float(control_rate_hz) / self.arm_rpc_rate_hz))
+        self._gripper_rpc_stride = max(1, round(float(control_rate_hz) / self.gripper_rpc_rate_hz))
+        self._rpc_frame = 0
         self.sim_only = _is_sim_only(robot_ip)
         self.arm: Optional[TB6R5Interface] = None
         self.log_joint_count = max(int(log_joint_count), len(TB6R5_JOINT_NAMES))
         self.gripper_trigger_name = gripper_trigger_name
-        self.gripper_trigger_threshold = float(gripper_trigger_threshold)
-        self.gripper_open_cmd = float(gripper_open_cmd)
-        self.gripper_closed_cmd = float(gripper_closed_cmd)
         self.gripper_observation_default = float(gripper_observation_default)
-        self.joystick_controller = str(joystick_controller).lower()
-        self.joystick_axis_click = str(joystick_axis_click)
         self.gripper_max_d = max(float(gripper_max_d), 0.0)
         self.two_fingers_gripper_interval = max(float(two_fingers_gripper_interval), 0.0)
         self.two_fingers_gripper_cmd_delta = max(float(two_fingers_gripper_cmd_delta), 0.0)
         self.disable_gripper = bool(disable_gripper)
+        self._target_gripper_distance_mm = self.gripper_max_d
         self._last_gripper_distance_cmd: Optional[float] = None
         self._last_gripper_rpc_time = 0.0
-        self._prev_joystick_axis_click = False
-        self._gripper_stream_active = False
-        self._last_gripper_action_cmd = self.gripper_open_cmd
         self.camera_serial_dict = camera_serial_dict or DEFAULT_REALSENSE_SERIAL_DICT
         self.camera_serial_to_name = {serial: name for name, serial in self.camera_serial_dict.items()}
         self.camera_width = camera_width
@@ -243,6 +245,12 @@ class TB6R5TeleopController(HardwareTeleopController):
         self.camera_jpg_quality = camera_jpg_quality
         self._prev_a_button_state = False
         self._prev_x_button_state = False
+        self.require_grip_to_send_commands = bool(require_grip_to_send_commands)
+        self.require_joystick_arm = bool(require_joystick_arm)
+        self.teleop_arm_button = teleop_arm_button
+        self._teleop_armed = not self.require_joystick_arm or self.sim_only
+        self._prev_teleop_arm_button = False
+        self._last_unarmed_grip_hint_time = 0.0
         self._home_q = np.deg2rad(DEFAULT_HOME_JOINT_DEG)
         self._cartesian_target: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._cartesian_last_target: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -261,6 +269,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         self._jog_rot_ref_controller_quat: Dict[str, np.ndarray] = {}
         self._jog_rot_ref_tcp_quat: Dict[str, np.ndarray] = {}
         self._last_home_time = 0.0
+        self._homing_in_progress = False
         self._last_cartesian_wait_print = 0.0
         self._preview_stream_count: Dict[str, int] = {}
         self._last_preview_cmd_print = 0.0
@@ -284,6 +293,7 @@ class TB6R5TeleopController(HardwareTeleopController):
                 joint_vel=self.joint_vel,
                 joint_acc=self.joint_acc,
                 joint_dec=self.joint_dec,
+                subloop1_immediate=self.subloop1_immediate,
             )
             print(
                 "[TB6R5] jog_any_c preview: PICO teleop + Placo/Meshcat only. "
@@ -348,6 +358,16 @@ class TB6R5TeleopController(HardwareTeleopController):
             )
         if self.print_ik_tcp_pose:
             print(f"[TB6R5] IK TCP pose print enabled (interval={self.print_ik_tcp_pose_interval_s:.2f}s).")
+        if self.require_joystick_arm and not self.sim_only:
+            print(
+                f"[TB6R5] 遥控门控：按 {self.teleop_arm_button} 开启/关闭遥控；"
+                "开启后按住 right_grip 移动臂，right_trigger 控制夹爪。"
+            )
+        elif self.require_grip_to_send_commands:
+            print(
+                "[TB6R5] Command gate: RPC is sent only while right_grip is held "
+                "(prevents trigger/button UI from moving the robot)."
+            )
         self._init_lerobot_logger()
 
     def _init_lerobot_logger(self):
@@ -368,7 +388,7 @@ class TB6R5TeleopController(HardwareTeleopController):
             image_height=self.camera_height,
             image_width=self.camera_width,
             use_videos=True,
-            include_depth=self.enable_camera_depth,
+            include_depth=self.lerobot_include_depth,
             overwrite=self.lerobot_overwrite,
             resume=self.lerobot_resume,
             streaming_encoding=self.lerobot_streaming_encoding,
@@ -377,9 +397,10 @@ class TB6R5TeleopController(HardwareTeleopController):
             encoder_threads=self.lerobot_encoder_threads,
         )
         print(
-            "[TB6R5] LeRobot v3 online logging enabled "
-            f"(root={self.lerobot_root}, repo_id={self.lerobot_repo_id}). "
-            "B: start/stop episode; A: discard; no .pkl per segment."
+            "[TB6R5] LeRobot v3 online logging enabled (lerobot_record-compatible schema) "
+            f"(root={self.lerobot_root}, repo_id={self.lerobot_repo_id}, "
+            f"fps={int(self.log_freq)}, depth={self.lerobot_include_depth}). "
+            "B: start/stop episode; A: discard."
         )
 
     # ------------------------------------------------------------------
@@ -431,7 +452,7 @@ class TB6R5TeleopController(HardwareTeleopController):
             ip=self.robot_ip,
             rpc_port=self.rpc_port,
             joint_count=self.log_joint_count,
-            rpc_cmd_rate_hz=self.control_rate_hz,
+            rpc_cmd_rate_hz=self.arm_rpc_rate_hz,
             jog_any_c_interrupt=self.jog_any_c_interrupt,
             zone_ratio=self.zone_ratio,
             jog_any_c_async_timeout_ms=self.jog_any_c_async_timeout_ms,
@@ -441,18 +462,31 @@ class TB6R5TeleopController(HardwareTeleopController):
             joint_vel=self.joint_vel,
             joint_acc=self.joint_acc,
             joint_dec=self.joint_dec,
+            subloop1_immediate=self.subloop1_immediate,
         )
         self.arm.connect()
         if self.teleop_mode == "jog_any_c" and not self.arm.is_robottarget_healthy():
             print("[TB6R5] Warning: Topic robottarget not available yet; wait for RT feedback before teleop.")
-        print(f"TB6-R5 ready (control/RPC rate: {self.control_rate_hz} Hz).")
+        print(
+            f"TB6-R5 ready (control: {self.control_rate_hz} Hz, "
+            f"arm RPC: {self.arm_rpc_rate_hz:.1f} Hz, gripper RPC: {self.gripper_rpc_rate_hz:.1f} Hz)."
+        )
+        if self.require_joystick_arm and not self.sim_only:
+            print(f"[TB6R5] 请按 {self.teleop_arm_button} 开启遥控。")
 
     def _shutdown_robot(self):
         if self.arm is None:
             return
         print("Shutting down TB6-R5 ...")
-        self._open_gripper_for_home()
-        self.arm.go_home(self._home_q)
+        # Close any session opened during teleop first.
+        self.arm.exit_subloop1_if_active(timeout_ms=3000, blocking_exit=True)
+        try:
+            self._home_robot_hardware(settle_timeout_s=8.0)
+        finally:
+            # Guarantee SubLoop1 is exited before SDK/topic teardown (Ctrl+C safety):
+            # an active session during shutdown can crash the SDK destructors.
+            self.arm.send_subloop1_exit(timeout_ms=3000, blocking=True)
+            print("[TB6R5] Shutdown: SubLoop1 exit sent.")
         time.sleep(1.0)
         self.arm.disable()
         print("TB6-R5 shut down.")
@@ -462,68 +496,144 @@ class TB6R5TeleopController(HardwareTeleopController):
     # ------------------------------------------------------------------
 
     def _pre_ik_update(self):
+        self._check_teleop_arm_toggle()
+        self._maybe_hint_teleop_not_armed()
         self._check_home_button()
-        self._check_joystick_axis_click_gripper_toggle()
 
-    def _update_gripper_target(self):
-        """Joystick axisX/axisY -> MoveTwoFingersGripper when stream is toggled on."""
-        if self.disable_gripper or not self._gripper_stream_active or self.arm is None:
+    def _is_teleop_armed(self) -> bool:
+        if self.sim_only:
+            return True
+        if not self.require_joystick_arm:
+            return True
+        return self._teleop_armed
+
+    def _is_grip_session_active(self) -> bool:
+        return any(self.active.get(name, False) for name in self.manipulator_config)
+
+    def _on_grip_session_end(self, src_name: str) -> None:
+        """Close SubLoop1 when right_grip is released so queued JogAnyJ does not abort abruptly."""
+        if self.arm is None or self.sim_only:
+            return
+        if self.arm.exit_subloop1_if_active():
+            print(f"[TB6R5] {src_name}: SubLoop1 exit 已异步发送（松开 right_grip）")
+
+    def _is_command_sending_allowed(self) -> bool:
+        if self.arm is None or self.sim_only:
+            return False
+        if not self._is_teleop_armed():
+            return False
+        if self.require_grip_to_send_commands and not self._is_grip_session_active():
+            return False
+        return True
+
+    def _check_teleop_arm_toggle(self):
+        """Toggle teleop armed state via joystick click (software gate only, no RPC Enable)."""
+        if not self.require_joystick_arm or self.arm is None or self.sim_only:
             return
         try:
-            axis_x, axis_y = self.xr_client.get_joystick_state(self.joystick_controller)
+            pressed = self.xr_client.get_button_state_by_name(self.teleop_arm_button)
         except Exception:
             return
+        if pressed and not self._prev_teleop_arm_button:
+            if self._teleop_armed:
+                self._teleop_armed = False
+                self._clear_teleop_session_state()
+                if self.arm is not None:
+                    self.arm.exit_subloop1_if_active()
+                print("[TB6R5] 遥控已关闭（机器人不会再接收运动指令）")
+            else:
+                self._teleop_armed = True
+                self._update_robot_state()
+                print("=" * 60)
+                print("[TB6R5] 遥控已开启")
+                print("  - 按住 right_grip：移动机械臂")
+                print("  - right_trigger：控制夹爪")
+                print(f"  - 再按 {self.teleop_arm_button}：关闭遥控")
+                print("=" * 60)
+        self._prev_teleop_arm_button = pressed
 
-        distance = TB6R5Interface.gripper_distance_from_joystick_axes(
-            axis_x,
-            axis_y,
-            self.gripper_max_d,
-        )
-        self._last_gripper_action_cmd = (
-            self.gripper_closed_cmd
-            if distance >= self.gripper_max_d - 1e-6
-            else self.gripper_open_cmd
-        )
-
+    def _maybe_hint_teleop_not_armed(self):
+        if not self.require_joystick_arm or self.sim_only or self._teleop_armed:
+            return
+        if not self._is_grip_session_active():
+            return
         now = time.time()
-        if self._last_gripper_distance_cmd is not None:
-            if abs(distance - self._last_gripper_distance_cmd) < self.two_fingers_gripper_cmd_delta:
-                if now - self._last_gripper_rpc_time < self._min_gripper_rpc_interval_s():
-                    return
+        if now - self._last_unarmed_grip_hint_time < 2.0:
+            return
+        self._last_unarmed_grip_hint_time = now
+        print(f"[TB6R5] 遥控未开启：请先按 {self.teleop_arm_button} 开启遥控。")
 
-        self.arm.move_two_fingers_gripper(
-            distance,
-            interval=self.two_fingers_gripper_interval,
-            max_distance=self.gripper_max_d,
-        )
-        self._last_gripper_distance_cmd = distance
-        self._last_gripper_rpc_time = now
+    def _clear_teleop_session_state(self):
+        for name in self.manipulator_config:
+            self.ref_ee_xyz[name] = None
+            self.ref_ee_quat[name] = None
+            self.ref_controller_xyz[name] = None
+            self.ref_controller_quat[name] = None
+            self.active[name] = False
+            self._locked_down_quat.pop(name, None)
+        self._cartesian_target.clear()
+        self._cartesian_warmup.clear()
+        self._cartesian_last_target.clear()
+        self._cartesian_started.clear()
+        self._cartesian_blocked_until_release.clear()
+        self._cartesian_debug_frames.clear()
+        self._locked_down_quat.clear()
+        self._reset_viz_controller_session_anchors()
+        self._jog_rot_ref_controller_quat.clear()
+        self._jog_rot_ref_tcp_quat.clear()
+        self._preview_stream_count.clear()
 
-    @staticmethod
-    def _min_gripper_rpc_interval_s() -> float:
-        return 0.05
+    def _update_gripper_target(self):
+        self._update_gripper_target_from_trigger()
 
-    def _check_joystick_axis_click_gripper_toggle(self):
-        """Joystick axis click toggles MoveTwoFingersGripper streaming on/off."""
+    def _update_gripper_target_from_trigger(self):
+        """right_trigger -> target gripper distance in mm (0=closed, max=open)."""
         if self.disable_gripper:
             return
         try:
-            clicked = self.xr_client.get_button_state_by_name(self.joystick_axis_click)
+            trigger = self.xr_client.get_key_value_by_name(self.gripper_trigger_name)
         except Exception:
-            clicked = False
+            return
+        self._target_gripper_distance_mm = TB6R5Interface.gripper_distance_from_trigger(
+            trigger,
+            self.gripper_max_d,
+        )
 
-        if clicked and not self._prev_joystick_axis_click:
-            self._gripper_stream_active = not self._gripper_stream_active
-            state = "ON" if self._gripper_stream_active else "OFF"
-            print(
-                f"[TB6R5] {self.joystick_axis_click}: gripper stream {state} "
-                f"(gripper_max_d={self.gripper_max_d:.0f}, "
-                f"interval={self.two_fingers_gripper_interval:.0f})"
-            )
-            if not self._gripper_stream_active:
-                self._last_gripper_distance_cmd = None
+    def _record_gripper_command(self, distance_mm: float) -> None:
+        self._last_gripper_distance_cmd = float(distance_mm)
+        self._last_gripper_rpc_time = time.time()
 
-        self._prev_joystick_axis_click = clicked
+    def _advance_rpc_tick(self) -> None:
+        self._rpc_frame += 1
+
+    def _on_arm_rpc_tick(self) -> bool:
+        return self._rpc_frame % self._arm_rpc_stride == 0
+
+    def _on_gripper_rpc_tick(self) -> bool:
+        return self._rpc_frame % self._gripper_rpc_stride == 0
+
+    def _gripper_cmd_delta_for_tick(self) -> float:
+        if self._on_gripper_rpc_tick():
+            return self.two_fingers_gripper_cmd_delta
+        return float("inf")
+
+    def _send_gripper_only_if_needed(self, force: bool = False) -> None:
+        if self.disable_gripper or self.arm is None:
+            return
+        if not force and not self._on_gripper_rpc_tick():
+            return
+        if not force and not self._is_command_sending_allowed():
+            return
+        distance_mm = self._target_gripper_distance_mm
+        ok = self.arm.send_gripper_only(
+            distance_mm,
+            interval=self.two_fingers_gripper_interval,
+            max_distance=self.gripper_max_d,
+            force=force,
+            cmd_delta=self.two_fingers_gripper_cmd_delta,
+        )
+        if ok:
+            self._record_gripper_command(distance_mm)
 
     def _check_home_button(self):
         """Press X: move to DEFAULT_HOME_JOINT_DEG."""
@@ -599,54 +709,54 @@ class TB6R5TeleopController(HardwareTeleopController):
             return
         super().run()
 
-    def _open_gripper_for_home(self) -> None:
-        """Open gripper once before homing (sequential RPC, avoids blocking during arm move)."""
-        if self.disable_gripper or self.arm is None:
-            return
+    def _home_robot_hardware(self, settle_timeout_s: float = 15.0) -> bool:
+        """Home arm + open gripper via SubLoop1 (MoveAbsJ + MoveTwoFingersGripper)."""
+        if self.arm is None:
+            return True
+        open_distance = self.gripper_max_d
+        if self.disable_gripper:
+            return bool(self.arm.go_home(self._home_q, settle_timeout_s=settle_timeout_s))
         print(
-            f"[TB6R5] Homing: MoveTwoFingersGripper(distance=0, "
-            f"interval={self.two_fingers_gripper_interval:.0f})"
+            f"[TB6R5] Homing via SubLoop1: MoveAbsJ(home) + "
+            f"MoveTwoFingersGripper(distance={open_distance:.1f}mm, "
+            f"interval={self.two_fingers_gripper_interval:.0f}) + exit"
         )
-        self.arm.move_two_fingers_gripper(
-            distance=0.0,
+        ok = self.arm.go_home(
+            self._home_q,
+            gripper_distance=open_distance,
             interval=self.two_fingers_gripper_interval,
             max_distance=self.gripper_max_d,
+            settle_timeout_s=settle_timeout_s,
         )
-        self._last_gripper_distance_cmd = 0.0
-        self._last_gripper_action_cmd = self.gripper_open_cmd
-        self._last_gripper_rpc_time = time.time()
+        if ok:
+            self._target_gripper_distance_mm = open_distance
+            self._record_gripper_command(open_distance)
+            print("[TB6R5] Homing complete (SubLoop1 MoveAbsJ + gripper + exit).")
+        else:
+            print(
+                "[TB6R5] Homing failed. Wait for the robot to stop, then retry once. "
+                "Do not press A repeatedly."
+            )
+        return ok
 
     def _go_to_home_pose(self):
+        if self._homing_in_progress:
+            print("[TB6R5] Homing already in progress; ignoring duplicate request.")
+            return
         print(f"[TB6R5] Homing to {DEFAULT_HOME_JOINT_DEG} deg")
-        self._gripper_stream_active = False
+        self._homing_in_progress = True
         self._last_gripper_distance_cmd = None
         self.placo_robot.state.q[self.joint_slice] = self._home_q.copy()
         self.placo_robot.update_kinematics()
         self.sync_end_effector_poses_to_placo_tasks()
+        self._clear_teleop_session_state()
 
-        for name in self.manipulator_config:
-            self.ref_ee_xyz[name] = None
-            self.ref_ee_quat[name] = None
-            self.ref_controller_xyz[name] = None
-            self.ref_controller_quat[name] = None
-            self.active[name] = False
-            self._locked_down_quat.pop(name, None)
-        self._cartesian_target.clear()
-        self._cartesian_warmup.clear()
-        self._cartesian_last_target.clear()
-        self._cartesian_started.clear()
-        self._cartesian_blocked_until_release.clear()
-        self._cartesian_debug_frames.clear()
-        self._locked_down_quat.clear()
-        self._reset_viz_controller_session_anchors()
-        self._jog_rot_ref_controller_quat.clear()
-        self._jog_rot_ref_tcp_quat.clear()
-        self._preview_stream_count.clear()
-
-        if self.arm is not None:
-            self._open_gripper_for_home()
-            self.arm.go_home(self._home_q)
-        self._last_home_time = time.time()
+        try:
+            if self.arm is not None:
+                self._home_robot_hardware()
+        finally:
+            self._homing_in_progress = False
+            self._last_home_time = time.time()
 
     def _limit_cartesian_step(
         self,
@@ -974,8 +1084,6 @@ class TB6R5TeleopController(HardwareTeleopController):
             return True
         if self.arm is None:
             return False
-        if time.time() - self._last_home_time < HOME_SETTLE_TIME_S:
-            return False
         return self.arm.is_topic_healthy()
 
     def _warn_cartesian_not_ready(self, src_name: str):
@@ -987,8 +1095,6 @@ class TB6R5TeleopController(HardwareTeleopController):
         if self.arm is None:
             reasons.append("hardware not connected (sim-only; jog_any_c needs a real robot)")
         else:
-            if now - self._last_home_time < HOME_SETTLE_TIME_S:
-                reasons.append("home settling")
             if not self.arm.is_topic_healthy():
                 reasons.append("topic feedback unavailable")
         detail = ", ".join(reasons) if reasons else "unknown"
@@ -1002,6 +1108,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         Both False: full 6-DOF pose from PICO position + rotation.
         """
         self.placo_robot.update_kinematics()
+        prev_active = {k: self.active.get(k, False) for k in self.manipulator_config}
 
         for src_name, config in self.manipulator_config.items():
             xr_grip_val = self.xr_client.get_key_value_by_name(config["control_trigger"])
@@ -1182,6 +1289,8 @@ class TB6R5TeleopController(HardwareTeleopController):
                     target_quat,
                 )
             else:
+                if prev_active.get(src_name, False):
+                    self._on_grip_session_end(src_name)
                 if self.ref_ee_xyz[src_name] is not None:
                     print(f"{src_name} is deactivated.")
                     self.ref_ee_xyz[src_name] = None
@@ -1210,10 +1319,16 @@ class TB6R5TeleopController(HardwareTeleopController):
         prev_active = {k: self.active.get(k, False) for k in self.manipulator_config}
         super()._update_ik()
         for src_name in self.manipulator_config:
+            if prev_active.get(src_name, False) and not self.active.get(src_name, False):
+                self._on_grip_session_end(src_name)
             if self.active.get(src_name, False) and not prev_active.get(src_name, False):
                 self._joint_preview_stream_count[src_name] = 0
                 if self.arm is not None:
                     self.arm.reset_joint_stream()
+                if self._is_teleop_armed() and not self.sim_only:
+                    print(f"[TB6R5] {src_name}: 开始发送机器人指令（按住 right_grip）")
+                elif self.require_joystick_arm and not self.sim_only:
+                    print(f"[TB6R5] {src_name}: 仅 Placo 预览（遥控未开启，不会下发 RPC）")
         # Match UR5 behavior: keep IK target frame aligned with actual EE when inactive
         for src_name, config in self.manipulator_config.items():
             if self.active.get(src_name, False):
@@ -1230,9 +1345,12 @@ class TB6R5TeleopController(HardwareTeleopController):
             self.placo_robot.state.q[self.joint_slice] = self.arm.get_joint_positions()[: len(TB6R5_JOINT_NAMES)]
 
     def _send_command(self):
+        if not self._is_command_sending_allowed():
+            return
+        if threading.current_thread().name != "_ik_thread":
+            return
+        self._advance_rpc_tick()
         if self.teleop_mode == "jog_any_c":
-            if threading.current_thread().name != "_ik_thread":
-                return
             for name in self.manipulator_config:
                 if not self.active.get(name, False):
                     continue
@@ -1254,7 +1372,18 @@ class TB6R5TeleopController(HardwareTeleopController):
                     continue
                 if self.arm is None:
                     continue
-                self.arm.set_cartesian_target(xyz, quat)
+                if not self._on_arm_rpc_tick():
+                    continue
+                self.arm.set_cartesian_target_with_gripper(
+                    xyz,
+                    quat,
+                    self._target_gripper_distance_mm,
+                    interval=self.two_fingers_gripper_interval,
+                    max_distance=self.gripper_max_d,
+                    cmd_delta=self._gripper_cmd_delta_for_tick(),
+                )
+                if self._on_gripper_rpc_tick() and self._last_gripper_distance_cmd != self._target_gripper_distance_mm:
+                    self._record_gripper_command(self._target_gripper_distance_mm)
                 if self.arm.has_fault():
                     print(f"[TB6R5] {name}: JogAnyC fault; clearing and ending this grip segment.")
                     self.arm.clear_error()
@@ -1268,14 +1397,15 @@ class TB6R5TeleopController(HardwareTeleopController):
                     self._cartesian_last_target.pop(name, None)
                     self._cartesian_warmup.pop(name, None)
                     self._cartesian_started.pop(name, None)
+            if not any(self.active.get(name, False) for name in self.manipulator_config):
+                self._send_gripper_only_if_needed()
             return
 
         if self.arm is None:
             if not self.sim_only:
                 return
-        if threading.current_thread().name != "_ik_thread":
-            return
 
+        any_arm_active = False
         for name in self.manipulator_config:
             if self.active.get(name, False):
                 q_des = self.placo_robot.state.q[self.joint_slice].copy()
@@ -1286,7 +1416,20 @@ class TB6R5TeleopController(HardwareTeleopController):
                 if self.sim_only:
                     self._preview_or_apply_sim_joint_target(q_des, name)
                 elif self.arm is not None:
-                    self.arm.set_joint_positions(q_des, force=True)
+                    if not self._on_arm_rpc_tick():
+                        continue
+                    any_arm_active = True
+                    sent = self.arm.set_joint_positions_with_gripper(
+                        q_des,
+                        self._target_gripper_distance_mm,
+                        interval=self.two_fingers_gripper_interval,
+                        max_distance=self.gripper_max_d,
+                        cmd_delta=self._gripper_cmd_delta_for_tick(),
+                    )
+                    if sent and self._on_gripper_rpc_tick():
+                        self._record_gripper_command(self._target_gripper_distance_mm)
+        if not any_arm_active:
+            self._send_gripper_only_if_needed()
 
     def _is_tcp_z_safe(self, src_name: str, target_xyz: np.ndarray) -> bool:
         z = float(target_xyz[2])
@@ -1340,13 +1483,22 @@ class TB6R5TeleopController(HardwareTeleopController):
         return result
 
     def _get_gripper_action_for_logging(self) -> float:
-        if self._last_gripper_distance_cmd is not None and self.gripper_max_d > 0.0:
-            return self._last_gripper_distance_cmd / self.gripper_max_d
-        return self._last_gripper_action_cmd
+        if self._last_gripper_distance_cmd is not None:
+            return float(self._last_gripper_distance_cmd)
+        return float(self._target_gripper_distance_mm)
+
+    def _get_gripper_observation_for_logging(self) -> float:
+        if self.arm is not None:
+            feedback_mm = self.arm.get_gripper_distance_mm()
+            if feedback_mm is not None:
+                return float(feedback_mm)
+        if self._last_gripper_distance_cmd is not None:
+            return float(self._last_gripper_distance_cmd)
+        return float(self.gripper_observation_default)
 
     def _get_robot_state_for_logging(self) -> Dict:
         gripper_action = self._get_gripper_action_for_logging()
-        gripper_observation = self.gripper_observation_default
+        gripper_observation = self._get_gripper_observation_for_logging()
 
         if self.arm is None:
             q = self._pad_log_vector(self.placo_robot.state.q[self.joint_slice].copy(), self.log_joint_count)
@@ -1367,8 +1519,8 @@ class TB6R5TeleopController(HardwareTeleopController):
         action = np.concatenate([action_joints, np.array([gripper_action], dtype=float)])
 
         state = {
-            # 8-D data requested for downstream collection:
-            # first 7 values are arm joints, last value is gripper open/close.
+            # 7-D vectors: 6 arm joints (rad) + gripper distance (mm).
+            # action[6] = commanded distance (mm); observation.state[6] = actual_pos feedback (mm).
             "observation": observation,
             "action": action,
             "qpos": observation.copy(),
@@ -1378,6 +1530,8 @@ class TB6R5TeleopController(HardwareTeleopController):
             "joint_action": action_joints,
             "gripper_qpos": gripper_observation,
             "gripper_action": gripper_action,
+            "gripper_distance_mm": gripper_observation,
+            "gripper_command_mm": gripper_action,
             "topic_healthy": topic_healthy,
         }
 

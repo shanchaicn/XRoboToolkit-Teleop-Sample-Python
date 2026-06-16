@@ -204,6 +204,8 @@ def main() -> int:
     print(f"MAE(all):     {mae_all:.6f}")
     for i, v in enumerate(mae_per_dim):
         print(f"MAE(action[{i}]): {float(v):.6f}")
+    if mae_per_dim.shape[0] >= 7:
+        print(f"MAE(action[6]) gripper distance: {float(mae_per_dim[6]):.4f} mm")
     print("===============================================")
 
     output_dir = Path(args.output_dir) if args.output_dir else Path("outputs/eval_act") / Path(args.dataset_root).name

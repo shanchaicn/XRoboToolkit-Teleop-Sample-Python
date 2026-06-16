@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_pico_ctl_tb6r5"
+version = "0.1.0"
+description = "LeRobot PICO VR teleoperator for TB6-R5 using TB6R5TeleopController (VR buttons, no keyboard)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "lerobot>=0.4.0",
+    "numpy",
+    "placo",
+    "xrobotoolkit_teleop",
+]
+
+[project.urls]
+Homepage = "https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Python"
+
+[project.scripts]
+lerobot-record-pico-ctl = "lerobot_teleoperator_pico_ctl_tb6r5.record_cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lerobot_teleoperator_pico_ctl_tb6r5*"]
