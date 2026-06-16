@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tb6r5_policy_infer"
+version = "0.1.0"
+description = "LeRobot ACT policy inference and offline evaluation for TB6-R5"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "lerobot>=0.4.0",
+    "numpy",
+    "torch",
+    "opencv-python",
+    "matplotlib",
+]
+
+# transformers / huggingface-hub 须与 lerobot 主版本对齐，勿在 pyproject 里写死：
+#   lerobot 0.4.x → transformers<5, huggingface-hub<0.36  （见 README）
+#   lerobot 0.5.x → transformers>=5.3, huggingface-hub>=1.16
+
+# 真机推理还需本地安装 xrobotoolkit_teleop（本仓库根目录，不在 PyPI）：
+#   pip install -e . --no-deps
+# 离线评估（tb6r5-policy-eval）不需要 xrobotoolkit_teleop。
+
+[project.urls]
+Homepage = "https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Python"
+
+[project.scripts]
+tb6r5-policy-infer = "tb6r5_policy_infer.cli:cli"
+tb6r5-policy-eval = "tb6r5_policy_infer.eval_cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tb6r5_policy_infer*"]
