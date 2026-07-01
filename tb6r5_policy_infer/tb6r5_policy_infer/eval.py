@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,115 @@ def plot_comparison_curves(
     print(f"Saved error curve:       {err_path}")
 
 
+def sync_inference_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def build_observation(sample: dict, image_keys: list[str], state_key: str) -> dict[str, np.ndarray]:
+    obs = {state_key: to_numpy(sample[state_key]).astype(np.float32)}
+    for k in image_keys:
+        obs[k] = to_hwc_uint8(sample[k])
+    return obs
+
+
+def run_single_inference(
+    sample: dict,
+    *,
+    image_keys: list[str],
+    state_key: str,
+    policy,
+    device: torch.device,
+    preprocessor,
+    postprocessor,
+    task: str,
+) -> np.ndarray:
+    obs = build_observation(sample, image_keys, state_key)
+    policy.reset()
+    sync_inference_device(device)
+    t0 = time.perf_counter()
+    pred = predict_action(
+        observation=obs,
+        policy=policy,
+        device=device,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        use_amp=False,
+        task=task,
+        robot_type="tb6r5",
+    )
+    sync_inference_device(device)
+    latency_s = time.perf_counter() - t0
+    return to_numpy(pred).squeeze(0).astype(np.float32), latency_s
+
+
+def print_inference_benchmark(latencies_s: list[float], *, warmup_samples: int = 0) -> None:
+    if not latencies_s:
+        print("[benchmark] No timed samples recorded.")
+        return
+    arr = np.asarray(latencies_s, dtype=np.float64)
+    mean_s = float(arr.mean())
+    fps = 1.0 / mean_s if mean_s > 0 else float("inf")
+    print("==== Inference Speed ====")
+    if warmup_samples > 0:
+        print(f"warmup:    {warmup_samples} (excluded from stats)")
+    print(f"samples:   {len(arr)}")
+    print(f"mean:      {mean_s * 1000:.2f} ms  ({fps:.2f} FPS)")
+    print(f"min:       {float(arr.min()) * 1000:.2f} ms  ({1.0 / float(arr.min()):.2f} FPS)")
+    print(f"max:       {float(arr.max()) * 1000:.2f} ms  ({1.0 / float(arr.max()):.2f} FPS)")
+    print(f"p50:       {float(np.percentile(arr, 50)) * 1000:.2f} ms")
+    print(f"p95:       {float(np.percentile(arr, 95)) * 1000:.2f} ms")
+    print("=========================")
+
+
+def run_inference_benchmark(args, *, policy, preprocessor, postprocessor, dataset, image_keys, state_key) -> int:
+    if args.warmup_samples < 0:
+        raise ValueError("--warmup-samples must be >= 0")
+    if args.bench_samples <= 0:
+        raise ValueError("--bench-samples must be > 0")
+
+    device = torch.device(policy.config.device)
+    n_total = len(dataset)
+    if n_total == 0:
+        raise ValueError("Dataset is empty.")
+
+    warmup_indices = list(range(min(args.warmup_samples, n_total)))
+    for idx in warmup_indices:
+        run_single_inference(
+            dataset[idx],
+            image_keys=image_keys,
+            state_key=state_key,
+            policy=policy,
+            device=device,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            task=args.task,
+        )
+
+    bench_indices = [i % n_total for i in range(args.bench_samples)]
+    latencies_s: list[float] = []
+    for idx in bench_indices:
+        _, latency_s = run_single_inference(
+            dataset[idx],
+            image_keys=image_keys,
+            state_key=state_key,
+            policy=policy,
+            device=device,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            task=args.task,
+        )
+        latencies_s.append(latency_s)
+
+    print("==== ACT Inference Benchmark (TB6R5 / LeRobot) ====")
+    print(f"dataset_root: {args.dataset_root}")
+    print(f"repo_id:      {args.repo_id}")
+    print(f"policy_path:  {args.policy_path}")
+    print(f"device:       {policy.config.device}")
+    print_inference_benchmark(latencies_s, warmup_samples=len(warmup_indices))
+    return 0
+
+
 def resolve_dataset_root(dataset_root: str | Path) -> Path:
     """Resolve dataset path and fail fast when offline metadata is missing."""
     root = Path(dataset_root).expanduser().resolve()
@@ -115,10 +225,18 @@ def resolve_dataset_root(dataset_root: str | Path) -> Path:
 
 
 def run_eval(args) -> int:
-    if args.max_samples <= 0:
-        raise ValueError("--max-samples must be > 0")
-    if args.stride <= 0:
-        raise ValueError("--stride must be > 0")
+    if getattr(args, "benchmark_only", False):
+        if args.warmup_samples < 0:
+            raise ValueError("--warmup-samples must be >= 0")
+        if args.bench_samples <= 0:
+            raise ValueError("--bench-samples must be > 0")
+    else:
+        if args.max_samples <= 0:
+            raise ValueError("--max-samples must be > 0")
+        if args.stride <= 0:
+            raise ValueError("--stride must be > 0")
+        if args.warmup_samples < 0:
+            raise ValueError("--warmup-samples must be >= 0")
 
     device = resolve_inference_device(args.device)
     cfg = load_pretrained_config(args.policy_path)
@@ -143,34 +261,53 @@ def run_eval(args) -> int:
     state_key = "observation.state"
     action_key = "action"
 
+    if getattr(args, "benchmark_only", False):
+        return run_inference_benchmark(
+            args,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            dataset=dataset,
+            image_keys=image_keys,
+            state_key=state_key,
+        )
+
     n_total = len(dataset)
     indices = list(range(0, n_total, args.stride))[: args.max_samples]
     if not indices:
         raise ValueError("No samples selected. Check --stride and dataset length.")
 
+    device = torch.device(policy.config.device)
+    warmup_indices = list(range(min(getattr(args, "warmup_samples", 0), n_total)))
+    for idx in warmup_indices:
+        run_single_inference(
+            dataset[idx],
+            image_keys=image_keys,
+            state_key=state_key,
+            policy=policy,
+            device=device,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            task=args.task,
+        )
+
     abs_err_acc = []
     pred_acc = []
     tgt_acc = []
+    latencies_s: list[float] = []
     for idx in indices:
         sample = dataset[idx]
-
-        obs = {state_key: to_numpy(sample[state_key]).astype(np.float32)}
-        for k in image_keys:
-            obs[k] = to_hwc_uint8(sample[k])
-
-        policy.reset()
-
-        pred = predict_action(
-            observation=obs,
+        pred_np, latency_s = run_single_inference(
+            sample,
+            image_keys=image_keys,
+            state_key=state_key,
             policy=policy,
-            device=torch.device(policy.config.device),
+            device=device,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
-            use_amp=False,
             task=args.task,
-            robot_type="tb6r5",
         )
-        pred_np = to_numpy(pred).squeeze(0).astype(np.float32)
+        latencies_s.append(latency_s)
         tgt_np = to_numpy(sample[action_key]).astype(np.float32).reshape(-1)
         if pred_np.shape[0] != tgt_np.shape[0]:
             raise ValueError(f"Action dim mismatch: pred={pred_np.shape}, target={tgt_np.shape} at idx={idx}")
@@ -197,6 +334,7 @@ def run_eval(args) -> int:
     if mae_per_dim.shape[0] >= 7:
         print(f"MAE(action[6]) gripper distance: {float(mae_per_dim[6]):.4f} mm")
     print("===============================================")
+    print_inference_benchmark(latencies_s, warmup_samples=len(warmup_indices))
 
     output_dir = Path(args.output_dir) if args.output_dir else Path("outputs/eval_act") / Path(args.dataset_root).name
     fps = float(ds_meta.fps) if ds_meta.fps else 50.0

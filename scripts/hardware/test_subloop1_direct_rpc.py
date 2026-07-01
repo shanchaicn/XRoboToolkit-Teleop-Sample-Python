@@ -3,6 +3,11 @@
 定期发送双模型指令，支持：
   --subloop-cmd subloop1  流式会话（首帧 async → 后续 async → exit），默认
   --subloop-cmd subloop    无会话，每帧 CallAwait 同步阻塞（指令名为 SubLoop，不带 1）
+  --subloop-cmd direct     无 SubLoop，发送 {JogAnyJ||夹爪}；传输由 --rpc-transport 控制
+
+传输 (--rpc-transport)：
+  sync   - CallAwait 每帧阻塞等待（direct/subloop 默认）
+  async  - CallAsync 每帧非阻塞（subloop1 固定为 async 流式会话，忽略此参数）
 
 模式 (--mode)：
   both    - JogAnyJ + MoveTwoFingersGripper
@@ -17,6 +22,8 @@ Usage:
     python scripts/hardware/test_subloop1_direct_rpc.py --subloop-cmd subloop --mode arm --arm-rate-hz 5
     python scripts/hardware/test_subloop1_direct_rpc.py --subloop-cmd subloop1 --mode gripper
     python scripts/hardware/test_subloop1_direct_rpc.py --dry-run --subloop-cmd subloop
+    python scripts/hardware/test_subloop1_direct_rpc.py --subloop-cmd direct --mode both
+    python scripts/hardware/test_subloop1_direct_rpc.py --subloop-cmd direct --rpc-transport async
 """
 
 from __future__ import annotations
@@ -38,7 +45,6 @@ from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
     DEFAULT_JOG_ANY_JOINT_DEC,
     DEFAULT_JOG_ANY_JOINT_VEL,
     DEFAULT_SUBLOOP1_EXEC_TIMEOUT_MS,
-    DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
     DEFAULT_ZONE_RATIO,
     NOT_RUN_EXECUTE,
     _setup_rpc_import,
@@ -46,19 +52,29 @@ from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
 
 DEFAULT_ROBOT_IP = "192.168.11.11"
 DEFAULT_RPC_PORT = 5868
+DEFAULT_GRIPPER_INTERVAL = 25.0
 
-FIXED_JOINT_DEG = (15.0, -100.0, None, -80.0, -90.0, -45.0)
-JOINT3_MIN_DEG = 85.0
-JOINT3_MAX_DEG = 95.0
+FIXED_JOINT_DEG = (0.0, -70.0, None, -80.0, -90.0, -60.0)
+JOINT3_MIN_DEG = 70.0
+JOINT3_MAX_DEG = 75.0
 GRIPPER_MIN_MM = 10.0
 GRIPPER_MAX_MM = 50.0
 
 TestMode = Literal["both", "arm", "gripper"]
-SubloopCmd = Literal["subloop1", "subloop"]
+SubloopCmd = Literal["subloop1", "subloop", "direct"]
+RpcTransport = Literal["sync", "async"]
 
 
 def _subloop_rpc_name(variant: SubloopCmd) -> str:
-    return "SubLoop1" if variant == "subloop1" else "SubLoop"
+    if variant == "subloop1":
+        return "SubLoop1"
+    if variant == "subloop":
+        return "SubLoop"
+    return "direct"
+
+
+def _format_dual_exec(arm_inner: str, grip_inner: str) -> str:
+    return f"{{{arm_inner}||{grip_inner}}}"
 
 
 def _format_subloop_exit_cmd(variant: SubloopCmd) -> str:
@@ -122,13 +138,15 @@ def _format_gripper_inner(distance_mm: float, interval: float) -> str:
     return f"MoveTwoFingersGripper --distance={d:.4f} --interval={max(0.0, interval):.4f}"
 
 
-def _format_subloop_exec(
+def _format_exec_cmd(
     arm_inner: str,
     grip_inner: str,
     *,
     variant: SubloopCmd,
     immediate: bool,
 ) -> str:
+    if variant == "direct":
+        return _format_dual_exec(arm_inner, grip_inner)
     name = _subloop_rpc_name(variant)
     imm = " --immediate=true" if immediate else ""
     return (
@@ -179,7 +197,16 @@ def _rate_strides(arm_rate_hz: float, gripper_rate_hz: float) -> tuple[float, in
 class DirectSubLoopRpc:
     """最小 RPC 客户端：init + SubLoop/SubLoop1 exec + exit + Disable。"""
 
-    def __init__(self, ip: str, port: int, *, variant: SubloopCmd, sl_immediate: bool):
+    def __init__(
+        self,
+        ip: str,
+        port: int,
+        *,
+        variant: SubloopCmd,
+        sl_immediate: bool,
+        transport: RpcTransport = "sync",
+        async_timeout_ms: int = 30_000,
+    ):
         _setup_rpc_import()
         import rpc
 
@@ -189,6 +216,8 @@ class DirectSubLoopRpc:
         self.variant = variant
         self.subloop_name = _subloop_rpc_name(variant)
         self.sl_immediate = sl_immediate
+        self.transport = transport
+        self.async_timeout_ms = async_timeout_ms
         self.client = rpc.CPPClient(ip, port)
         self._session_active = False
         self._async_pending = 0
@@ -250,20 +279,22 @@ class DirectSubLoopRpc:
         *,
         sync_timeout_ms: int,
     ) -> bool:
-        cmd = _format_subloop_exec(
+        cmd = _format_exec_cmd(
             arm_inner,
             grip_inner,
             variant=self.variant,
             immediate=self.sl_immediate,
         )
-        if self.variant == "subloop":
-            return self._call_sync(cmd, timeout_ms=sync_timeout_ms)
-        if not self._session_active:
-            ok = self._call_async(cmd, timeout_ms=5_000_000)
-            if ok:
-                self._session_active = True
-            return ok
-        return self._call_async(cmd, timeout_ms=DEFAULT_SUBLOOP1_EXEC_TIMEOUT_MS)
+        if self.variant == "subloop1":
+            if not self._session_active:
+                ok = self._call_async(cmd, timeout_ms=5_000_000)
+                if ok:
+                    self._session_active = True
+                return ok
+            return self._call_async(cmd, timeout_ms=DEFAULT_SUBLOOP1_EXEC_TIMEOUT_MS)
+        if self.transport == "async":
+            return self._call_async(cmd, timeout_ms=self.async_timeout_ms)
+        return self._call_sync(cmd, timeout_ms=sync_timeout_ms)
 
     def exit_session_async(self, timeout_ms: int = 10_000) -> bool:
         if self.variant != "subloop1" or not self._session_active:
@@ -298,9 +329,20 @@ class DirectSubLoopRpc:
         print("[direct] shutdown complete.")
 
 
+def _describe_transport(subloop_cmd: SubloopCmd, rpc_transport: RpcTransport) -> str:
+    if subloop_cmd == "subloop1":
+        return "async 流式会话 (SubLoop1)"
+    if rpc_transport == "async":
+        label = "JogAnyJ||夹爪" if subloop_cmd == "direct" else "SubLoop"
+        return f"async CallAsync/帧 ({label})"
+    label = "JogAnyJ||夹爪" if subloop_cmd == "direct" else "SubLoop"
+    return f"sync CallAwait/帧 ({label})"
+
+
 def main(
     mode: TestMode = "both",
     subloop_cmd: SubloopCmd = "subloop1",
+    rpc_transport: RpcTransport = "sync",
     robot_ip: str = DEFAULT_ROBOT_IP,
     rpc_port: int = DEFAULT_RPC_PORT,
     arm_rate_hz: float = 20.0,
@@ -311,9 +353,10 @@ def main(
     joint_vel: float = DEFAULT_JOG_ANY_JOINT_VEL,
     joint_acc: float = DEFAULT_JOG_ANY_JOINT_ACC,
     joint_dec: float = DEFAULT_JOG_ANY_JOINT_DEC,
-    gripper_interval: float = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+    gripper_interval: float = DEFAULT_GRIPPER_INTERVAL,
     sl_immediate: bool = False,
     sync_exec_timeout_ms: int = 30_000,
+    async_exec_timeout_ms: int = 30_000,
     print_interval_s: float = 0.5,
     shutdown_ctrlc_pause_s: float = 10.0,
     shutdown_drain_timeout_s: float = 2.0,
@@ -343,17 +386,20 @@ def main(
             rpc_port,
             variant=subloop_cmd,
             sl_immediate=sl_immediate,
+            transport=rpc_transport,
+            async_timeout_ms=async_exec_timeout_ms,
         )
         rpc_client.init_robot()
-        transport = "sync CallAwait/帧" if subloop_cmd == "subloop" else "async 流式会话"
+        transport = _describe_transport(subloop_cmd, rpc_transport)
         print(
             f"[direct] {subloop_name} mode={mode} transport={transport} "
             f"arm={arm_rate_hz:.1f}Hz grip={gripper_rate_hz:.1f}Hz "
             f"period={period_s:.1f}s sl_immediate={sl_immediate}"
         )
     else:
+        transport = _describe_transport(subloop_cmd, rpc_transport)
         print(
-            f"[direct] dry-run {subloop_name} mode={mode} "
+            f"[direct] dry-run {subloop_name} mode={mode} transport={transport} "
             f"arm={arm_rate_hz:.1f}Hz grip={gripper_rate_hz:.1f}Hz"
         )
 
@@ -390,7 +436,7 @@ def main(
                     joint_dec=joint_dec,
                     gripper_interval=gripper_interval,
                 )
-                cmd = _format_subloop_exec(
+                cmd = _format_exec_cmd(
                     arm_inner,
                     grip_inner,
                     variant=subloop_cmd,
@@ -433,9 +479,14 @@ def main(
                             if subloop_cmd == "subloop1"
                             else ""
                         )
+                        transport_tag = (
+                            f" transport={rpc_transport}"
+                            if subloop_cmd != "subloop1"
+                            else ""
+                        )
                         print(
                             f"[direct] t={elapsed:5.2f}s [{chan}] sent={sent} "
-                            f"pending={rpc_client._async_pending}{extra}{session}"
+                            f"pending={rpc_client._async_pending}{transport_tag}{extra}{session}"
                         )
                         last_print = elapsed
 

@@ -8,28 +8,37 @@ import numpy as np
 import torch
 
 from .lerobot_compat import predict_action
-from xrobotoolkit_teleop.hardware.interface.tb6r5 import TB6R5Interface
 
-from .camera import CameraStream, show_camera_rgb
+from .camera import CameraPreview, create_camera_stream, destroy_camera_windows, parse_camera_serials
 from .constants import BOLD_GREEN, DEFAULT_REALSENSE_SERIAL_DICT, RESET
 from .gripper import (
     clamp_joint_step,
-    gripper_desired_closed,
+    clip_gripper_mm,
+    gripper_desired_open_mm,
     gripper_edge_min_steps,
+    gripper_mm_to_normalized,
+    gripper_normalized_to_mm,
+    latched_gripper_mm,
+    on_rpc_tick,
     print_gripper_config,
     print_gripper_status,
     resolve_gripper_observation_mm,
+    rpc_strides,
+    update_legacy_gripper_state,
+    validate_gripper_hysteresis_mm,
+)
 )
 from .policy import act_chunk_info, apply_act_inference_overrides, load_policy_components
 
 
 def go_home(
-    arm: TB6R5Interface,
+    arm,
     home_joint_deg: tuple[float, ...],
     settle_time_s: float,
     *,
     gripper_interval: float,
     gripper_max_distance: float,
+    gripper_min_distance: float,
 ) -> None:
     home_q = np.deg2rad(np.asarray(home_joint_deg, dtype=float))
     print(f"[ACT] Homing to {tuple(home_joint_deg)} deg ...")
@@ -43,6 +52,7 @@ def go_home(
         gripper_distance=gripper_max_distance,
         interval=gripper_interval,
         max_distance=gripper_max_distance,
+        min_distance=gripper_min_distance,
     )
     if settle_time_s > 0:
         time.sleep(settle_time_s)
@@ -54,16 +64,19 @@ def run_inference(args) -> int:
         raise ValueError("--fps must be > 0")
     if args.gripper_max_distance <= 0:
         raise ValueError("--gripper-max-distance must be > 0")
+    if args.gripper_min_distance < 0:
+        raise ValueError("--gripper-min-distance must be >= 0")
+    if args.gripper_min_distance > args.gripper_max_distance:
+        raise ValueError("--gripper-min-distance must be <= --gripper-max-distance")
+    if args.arm_rpc_rate_hz <= 0 or args.gripper_rpc_rate_hz <= 0:
+        raise ValueError("--arm-rpc-rate-hz and --gripper-rpc-rate-hz must be > 0")
     if not args.gripper_continuous:
-        if not 0.0 <= args.gripper_close_norm <= 1.0:
-            raise ValueError("--gripper-close-norm must be in [0, 1]")
-        if not 0.0 <= args.gripper_open_norm <= 1.0:
-            raise ValueError("--gripper-open-norm must be in [0, 1]")
-        if args.gripper_close_norm >= args.gripper_open_norm:
-            raise ValueError(
-                f"--gripper-close-norm ({args.gripper_close_norm}) must be < "
-                f"--gripper-open-norm ({args.gripper_open_norm}) for asymmetric hysteresis"
-            )
+        validate_gripper_hysteresis_mm(
+            args.gripper_close_mm,
+            args.gripper_open_mm,
+            args.gripper_min_distance,
+            args.gripper_max_distance,
+        )
         if args.gripper_edge_min_interval < 0:
             raise ValueError("--gripper-edge-min-interval must be >= 0")
 
@@ -80,23 +93,31 @@ def run_inference(args) -> int:
         refresh_policy_every_step=args.refresh_policy_every_step,
     )
 
-    from .camera import parse_camera_serials
-
-    serial_dict = parse_camera_serials(args.camera_serials, DEFAULT_REALSENSE_SERIAL_DICT)
-    camera_names = sorted(serial_dict.keys())
-    cam_stream: CameraStream | None = None
+    cam_stream = None
     black = np.zeros((args.camera_height, args.camera_width, 3), dtype=np.uint8)
     if not args.no_camera:
-        cam_stream = CameraStream(serial_dict, args.camera_width, args.camera_height, args.camera_fps)
+        cam_stream, camera_names = create_camera_stream(
+            camera_urls=args.camera_urls,
+            camera_devices=args.camera_devices,
+            camera_serials=args.camera_serials,
+            default_serial_dict=DEFAULT_REALSENSE_SERIAL_DICT,
+            width=args.camera_width,
+            height=args.camera_height,
+            fps=args.camera_fps,
+        )
         cam_stream.start()
         cam_stream.wait_ready()
     else:
+        camera_names = sorted(parse_camera_serials(args.camera_serials, DEFAULT_REALSENSE_SERIAL_DICT).keys())
         print("[ACT] --no-camera: feeding black frames (predictions will be meaningless)")
 
     arm = None
     home_joint_deg = tuple(args.home_joint_deg)
+    arm_stride, grip_stride = rpc_strides(args.fps, args.arm_rpc_rate_hz, args.gripper_rpc_rate_hz)
     gripper_edge_min_steps_val = gripper_edge_min_steps(args.fps, args.gripper_edge_min_interval)
     if not args.dry_run:
+        from xrobotoolkit_teleop.hardware.interface.tb6r5 import TB6R5Interface
+
         arm = TB6R5Interface(
             ip=args.robot_ip, rpc_port=args.rpc_port, joint_count=6, rpc_cmd_rate_hz=max(args.fps, 20)
         )
@@ -109,6 +130,7 @@ def run_inference(args) -> int:
                 args.home_settle_time,
                 gripper_interval=args.gripper_interval,
                 gripper_max_distance=args.gripper_max_distance,
+                gripper_min_distance=args.gripper_min_distance,
             )
     else:
         print("[ACT] Dry-run mode: no command will be sent")
@@ -116,7 +138,8 @@ def run_inference(args) -> int:
     dt = 1.0 / args.fps
     last_print = 0.0
     last_images: dict[str, np.ndarray] = {name: black.copy() for name in camera_names}
-    held_gripper_closed: bool | None = False if (arm is not None and not args.no_home_on_start) else None
+    held_gripper_open: bool | None = True if (arm is not None and not args.no_home_on_start) else None
+    pending_gripper_mm: float | None = None
     control_step = 0
     last_gripper_rpc_step = 0 if (arm is not None and not args.no_home_on_start) else -gripper_edge_min_steps_val
 
@@ -124,6 +147,7 @@ def run_inference(args) -> int:
     n_action_steps = getattr(policy.config, "n_action_steps", None)
     print_gripper_config(
         args.gripper_max_distance,
+        args.gripper_min_distance,
         args.gripper_interval,
         args.gripper_cmd_delta,
         args.gripper_continuous,
@@ -131,10 +155,24 @@ def run_inference(args) -> int:
         n_action_steps,
         args.temporal_ensemble_coeff,
         args.refresh_policy_every_step,
+        args.gripper_normalized,
+        arm_rpc_rate_hz=args.arm_rpc_rate_hz,
+        gripper_rpc_rate_hz=args.gripper_rpc_rate_hz,
+        control_fps=args.fps,
+        gripper_close_mm=None if args.gripper_continuous else args.gripper_close_mm,
+        gripper_open_mm=None if args.gripper_continuous else args.gripper_open_mm,
     )
     if args.show_camera and cam_stream is not None:
         print("[ACT] RGB preview enabled (windows: ACT RGB - realsense_0/1). Use --no-show-camera to disable.")
+    cam_preview = None
+    if args.show_camera and cam_stream is not None:
+        cam_preview = CameraPreview(cam_stream, fps=float(args.camera_preview_fps))
+        cam_preview.start()
     print("[ACT] Inference loop started. Press Ctrl+C to stop.")
+    print(
+        f"[ACT] Control loop {args.fps:.0f} Hz | "
+        f"arm RPC {args.arm_rpc_rate_hz:.0f} Hz | gripper RPC {args.gripper_rpc_rate_hz:.0f} Hz"
+    )
     try:
         while True:
             start_t = time.time()
@@ -144,10 +182,18 @@ def run_inference(args) -> int:
             else:
                 q_current = np.zeros(6, dtype=np.float32)
 
-            gripper_obs_mm = resolve_gripper_observation_mm(arm, args.gripper_observation_constant)
+            gripper_obs_mm = clip_gripper_mm(
+                resolve_gripper_observation_mm(arm, args.gripper_observation_constant),
+                args.gripper_min_distance,
+                args.gripper_max_distance,
+            )
+            if args.gripper_normalized:
+                gripper_obs = gripper_mm_to_normalized(gripper_obs_mm, args.gripper_max_distance)
+            else:
+                gripper_obs = gripper_obs_mm
             observation = {
                 "observation.state": np.concatenate(
-                    [q_current, np.array([gripper_obs_mm], dtype=np.float32)],
+                    [q_current, np.array([gripper_obs], dtype=np.float32)],
                     axis=0,
                 )
             }
@@ -157,8 +203,6 @@ def run_inference(args) -> int:
                 for name in camera_names:
                     if name in imgs:
                         last_images[name] = imgs[name]
-                if args.show_camera and last_images:
-                    show_camera_rgb(last_images)
             for name in camera_names:
                 observation[f"observation.images.{name}"] = last_images[name]
 
@@ -182,86 +226,151 @@ def run_inference(args) -> int:
             q_target = action[:6]
             q_cmd = clamp_joint_step(q_target, q_current, args.joint_step_max_rad)
 
-            gripper_raw_mm = float(action[6])
+            gripper_raw = float(action[6])
             now = time.time()
             sent = False
-            gripper_cmd_mm = float(np.clip(gripper_raw_mm, 0.0, args.gripper_max_distance))
+            if args.gripper_normalized:
+                gripper_cmd_mm = clip_gripper_mm(
+                    gripper_normalized_to_mm(gripper_raw, args.gripper_max_distance),
+                    args.gripper_min_distance,
+                    args.gripper_max_distance,
+                )
+            else:
+                gripper_cmd_mm = clip_gripper_mm(
+                    gripper_raw,
+                    args.gripper_min_distance,
+                    args.gripper_max_distance,
+                )
             send_gripper = False
-            gripper_cmd_dist: float | None = None
+            edge_accepted = False
 
             if args.gripper_continuous:
                 gripper_cmd_dist = gripper_cmd_mm
             else:
-                gripper_norm = gripper_cmd_mm / args.gripper_max_distance
-                desired_closed = gripper_desired_closed(
-                    gripper_norm,
-                    held_gripper_closed,
-                    args.gripper_close_norm,
-                    args.gripper_open_norm,
+                held_gripper_open, pending_gripper_mm, last_gripper_rpc_step, edge_accepted = (
+                    update_legacy_gripper_state(
+                        gripper_mm=gripper_cmd_mm,
+                        held_open=held_gripper_open,
+                        pending_mm=pending_gripper_mm,
+                        close_mm=args.gripper_close_mm,
+                        open_mm=args.gripper_open_mm,
+                        control_step=control_step,
+                        last_edge_step=last_gripper_rpc_step,
+                        edge_min_steps=gripper_edge_min_steps_val,
+                        min_distance=args.gripper_min_distance,
+                        max_distance=args.gripper_max_distance,
+                    )
                 )
-                gripper_edge = held_gripper_closed is None or desired_closed != held_gripper_closed
-                gripper_steps_since_rpc = control_step - last_gripper_rpc_step
-                if gripper_edge:
-                    gripper_cmd_dist = float(args.gripper_max_distance) if desired_closed else 0.0
-                    if gripper_steps_since_rpc >= gripper_edge_min_steps_val:
-                        send_gripper = True
-                        held_gripper_closed = desired_closed
-                        last_gripper_rpc_step = control_step
+                send_gripper = edge_accepted
 
             chunk_step, chunk_size = act_chunk_info(policy)
 
+            gripper_subloop: str | None = None
+            if arm is not None and on_rpc_tick(control_step, arm_stride):
+                on_gripper_rpc_tick = on_rpc_tick(control_step, grip_stride)
+                gripper_cmd_delta = args.gripper_cmd_delta if on_gripper_rpc_tick else float("inf")
+                if args.gripper_continuous:
+                    gripper_will_send = arm._should_send_gripper(
+                        gripper_cmd_mm,
+                        cmd_delta=gripper_cmd_delta,
+                        max_distance=args.gripper_max_distance,
+                        min_distance=args.gripper_min_distance,
+                    )
+                    sent = arm.set_joint_positions_with_gripper(
+                        q_cmd,
+                        gripper_cmd_mm,
+                        interval=args.gripper_interval,
+                        max_distance=args.gripper_max_distance,
+                        min_distance=args.gripper_min_distance,
+                        cmd_delta=gripper_cmd_delta,
+                    )
+                    gripper_subloop = f"distance={gripper_cmd_mm:.2f}mm" if gripper_will_send else "NotRunExecute"
+                else:
+                    latched_mm = latched_gripper_mm(
+                        held_gripper_open,
+                        min_distance=args.gripper_min_distance,
+                        max_distance=args.gripper_max_distance,
+                    )
+                    gripper_mm_for_rpc = (
+                        pending_gripper_mm
+                        if pending_gripper_mm is not None
+                        else (latched_mm if latched_mm is not None else float(args.gripper_max_distance))
+                    )
+                    legacy_gripper_cmd_delta = (
+                        args.gripper_cmd_delta if (on_gripper_rpc_tick and pending_gripper_mm is not None) else float("inf")
+                    )
+                    gripper_will_send = arm._should_send_gripper(
+                        gripper_mm_for_rpc,
+                        cmd_delta=legacy_gripper_cmd_delta,
+                        max_distance=args.gripper_max_distance,
+                        min_distance=args.gripper_min_distance,
+                    )
+                    sent = arm.set_joint_positions_with_gripper(
+                        q_cmd,
+                        gripper_mm_for_rpc,
+                        interval=args.gripper_interval,
+                        max_distance=args.gripper_max_distance,
+                        min_distance=args.gripper_min_distance,
+                        cmd_delta=legacy_gripper_cmd_delta,
+                    )
+                    if gripper_will_send and pending_gripper_mm is not None:
+                        pending_gripper_mm = None
+                    gripper_subloop = (
+                        f"distance={gripper_mm_for_rpc:.2f}mm" if gripper_will_send else "NotRunExecute"
+                    )
+
             if now - last_print >= args.print_every:
+                if args.gripper_normalized:
+                    action6_str = f"action[6]={gripper_raw:.3f} (norm)"
+                else:
+                    action6_str = f"action[6]={gripper_raw:.2f}mm"
                 print(
                     "[ACT] "
                     f"q_cur={np.round(q_current, 3)} "
                     f"q_tgt={np.round(q_target, 3)} "
-                    f"q_cmd={np.round(q_cmd, 3)}"
+                    f"q_cmd={np.round(q_cmd, 3)} "
+                    f"{action6_str}"
+                )
+                latched_display_mm = (
+                    latched_gripper_mm(
+                        held_gripper_open,
+                        min_distance=args.gripper_min_distance,
+                        max_distance=args.gripper_max_distance,
+                    )
+                    if not args.gripper_continuous
+                    else None
                 )
                 print_gripper_status(
-                    gripper_raw_mm=gripper_raw_mm,
-                    gripper_cmd_mm=gripper_cmd_dist if gripper_cmd_dist is not None else gripper_cmd_mm,
-                    gripper_obs_mm=gripper_obs_mm,
+                    gripper_raw=gripper_raw,
+                    gripper_cmd_mm=latched_display_mm if latched_display_mm is not None else gripper_cmd_mm,
+                    gripper_obs=gripper_obs,
                     sent=sent,
+                    gripper_min_distance=args.gripper_min_distance,
                     gripper_max_distance=args.gripper_max_distance,
                     gripper_interval=args.gripper_interval,
                     chunk_step=chunk_step,
                     chunk_size=chunk_size,
                     legacy_mode=not args.gripper_continuous,
-                    desired_closed=held_gripper_closed if not args.gripper_continuous else None,
+                    desired_open=held_gripper_open if not args.gripper_continuous else None,
                     send_gripper=send_gripper,
+                    gripper_normalized=args.gripper_normalized,
+                    gripper_subloop=gripper_subloop,
+                    pending_gripper_mm=pending_gripper_mm,
+                    edge_accepted=edge_accepted,
                 )
                 last_print = now
 
-            if arm is not None:
-                if args.gripper_continuous:
-                    sent = arm.set_joint_positions_with_gripper(
-                        q_cmd,
-                        gripper_cmd_mm,
-                        force=True,
-                        interval=args.gripper_interval,
-                        max_distance=args.gripper_max_distance,
-                        cmd_delta=args.gripper_cmd_delta,
-                    )
-                else:
-                    arm.set_joint_positions(q_cmd, force=True)
-                    if send_gripper and gripper_cmd_dist is not None:
-                        sent = arm.move_two_fingers_gripper(
-                            distance=gripper_cmd_dist,
-                            interval=args.gripper_interval,
-                            max_distance=args.gripper_max_distance,
-                        )
-
+            control_step += 1
             elapsed = time.time() - start_t
             if elapsed < dt:
                 time.sleep(dt - elapsed)
-            control_step += 1
     except KeyboardInterrupt:
         print("\n[ACT] Stopped by user.")
     finally:
+        if cam_preview is not None:
+            cam_preview.stop()
         if args.show_camera and cam_stream is not None:
-            import cv2
-
-            cv2.destroyAllWindows()
+            destroy_camera_windows()
         if cam_stream is not None:
             cam_stream.stop()
         if arm is not None:
@@ -273,6 +382,7 @@ def run_inference(args) -> int:
                         args.home_settle_time,
                         gripper_interval=args.gripper_interval,
                         gripper_max_distance=args.gripper_max_distance,
+                        gripper_min_distance=args.gripper_min_distance,
                     )
                 arm.disable()
             except Exception:

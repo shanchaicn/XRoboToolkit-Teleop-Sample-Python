@@ -20,6 +20,7 @@ from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
     DEFAULT_TELEOP_MODE,
     DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
     DEFAULT_GRIPPER_MAX_D,
+    DEFAULT_GRIPPER_MIN_D,
     DEFAULT_ZONE_RATIO,
     TB6R5Interface,
     TeleopMode,
@@ -41,7 +42,7 @@ TB6R5_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 DEFAULT_SCALE_FACTOR = 1.5
 DEFAULT_ROBOT_IP = "192.168.11.11"
 DEFAULT_RPC_PORT = 5868
-DEFAULT_HOME_JOINT_DEG = (15.0, -100.0, 90.0, -80.0, -90.0, -45.0)
+DEFAULT_HOME_JOINT_DEG = (80, -70, 70, -90, -90, -60)
 # RevA1 URDF sets velocity="0" on every joint; Placo then caps |dq| to 0 per step.
 DEFAULT_PLACO_JOINT_VMAX_RAD_S = 3.14
 DEFAULT_LOG_JOINT_COUNT = 6 # 6 Joints in the URDF
@@ -125,6 +126,8 @@ class TB6R5TeleopController(HardwareTeleopController):
         enable_camera: bool = False,
         camera_fps: int = 30,
         camera_serial_dict: Optional[Dict[str, str]] = None,
+        camera_devices: Optional[str] = None,
+        camera_urls: Optional[str] = None,
         camera_width: int = 640,
         camera_height: int = 480,
         enable_camera_depth: bool = True,
@@ -134,6 +137,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         gripper_trigger_name: str = DEFAULT_GRIPPER_TRIGGER_NAME,
         gripper_observation_default: float = DEFAULT_GRIPPER_OBSERVATION,
         gripper_max_d: float = DEFAULT_GRIPPER_MAX_D,
+        gripper_min_d: float = DEFAULT_GRIPPER_MIN_D,
         two_fingers_gripper_interval: float = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
         two_fingers_gripper_cmd_delta: float = DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA,
         disable_gripper: bool = False,
@@ -229,6 +233,11 @@ class TB6R5TeleopController(HardwareTeleopController):
         self.gripper_trigger_name = gripper_trigger_name
         self.gripper_observation_default = float(gripper_observation_default)
         self.gripper_max_d = max(float(gripper_max_d), 0.0)
+        self.gripper_min_d = max(float(gripper_min_d), 0.0)
+        if self.gripper_min_d > self.gripper_max_d:
+            raise ValueError(
+                f"gripper_min_d ({self.gripper_min_d}) must be <= gripper_max_d ({self.gripper_max_d})"
+            )
         self.two_fingers_gripper_interval = max(float(two_fingers_gripper_interval), 0.0)
         self.two_fingers_gripper_cmd_delta = max(float(two_fingers_gripper_cmd_delta), 0.0)
         self.disable_gripper = bool(disable_gripper)
@@ -236,6 +245,8 @@ class TB6R5TeleopController(HardwareTeleopController):
         self._last_gripper_distance_cmd: Optional[float] = None
         self._last_gripper_rpc_time = 0.0
         self.camera_serial_dict = camera_serial_dict or DEFAULT_REALSENSE_SERIAL_DICT
+        self.camera_devices = camera_devices
+        self.camera_urls = camera_urls
         self.camera_serial_to_name = {serial: name for name, serial in self.camera_serial_dict.items()}
         self.camera_width = camera_width
         self.camera_height = camera_height
@@ -375,7 +386,7 @@ class TB6R5TeleopController(HardwareTeleopController):
             return
         if not self.enable_log_data:
             raise ValueError("enable_lerobot_log requires enable_log_data=True")
-        camera_names = sorted(self.camera_serial_dict.keys()) if self.enable_camera else []
+        camera_names = self._camera_logical_names() if self.enable_camera else []
         vector_dim = self.log_joint_count + 1
         self.lerobot_logger = TB6LeRobotV3Logger(
             root=self.lerobot_root,
@@ -587,7 +598,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         self._update_gripper_target_from_trigger()
 
     def _update_gripper_target_from_trigger(self):
-        """right_trigger -> target gripper distance in mm (0=closed, max=open)."""
+        """right_trigger -> target gripper distance in mm (0=max_d, 1=min_d)."""
         if self.disable_gripper:
             return
         try:
@@ -597,6 +608,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         self._target_gripper_distance_mm = TB6R5Interface.gripper_distance_from_trigger(
             trigger,
             self.gripper_max_d,
+            self.gripper_min_d,
         )
 
     def _record_gripper_command(self, distance_mm: float) -> None:
@@ -629,6 +641,7 @@ class TB6R5TeleopController(HardwareTeleopController):
             distance_mm,
             interval=self.two_fingers_gripper_interval,
             max_distance=self.gripper_max_d,
+            min_distance=self.gripper_min_d,
             force=force,
             cmd_delta=self.two_fingers_gripper_cmd_delta,
         )
@@ -726,6 +739,7 @@ class TB6R5TeleopController(HardwareTeleopController):
             gripper_distance=open_distance,
             interval=self.two_fingers_gripper_interval,
             max_distance=self.gripper_max_d,
+            min_distance=self.gripper_min_d,
             settle_timeout_s=settle_timeout_s,
         )
         if ok:
@@ -1380,6 +1394,7 @@ class TB6R5TeleopController(HardwareTeleopController):
                     self._target_gripper_distance_mm,
                     interval=self.two_fingers_gripper_interval,
                     max_distance=self.gripper_max_d,
+                    min_distance=self.gripper_min_d,
                     cmd_delta=self._gripper_cmd_delta_for_tick(),
                 )
                 if self._on_gripper_rpc_tick() and self._last_gripper_distance_cmd != self._target_gripper_distance_mm:
@@ -1424,6 +1439,7 @@ class TB6R5TeleopController(HardwareTeleopController):
                         self._target_gripper_distance_mm,
                         interval=self.two_fingers_gripper_interval,
                         max_distance=self.gripper_max_d,
+                        min_distance=self.gripper_min_d,
                         cmd_delta=self._gripper_cmd_delta_for_tick(),
                     )
                     if sent and self._on_gripper_rpc_tick():
@@ -1482,19 +1498,25 @@ class TB6R5TeleopController(HardwareTeleopController):
             result[:n] = values[:n]
         return result
 
+    def _clip_gripper_mm_for_log(self, distance_mm: float) -> float:
+        """Clamp gripper distance to [min_d, max_d] mm for dataset / RPC (never normalized)."""
+        lo = min(self.gripper_min_d, self.gripper_max_d)
+        hi = max(self.gripper_min_d, self.gripper_max_d)
+        return float(np.clip(float(distance_mm), lo, hi))
+
     def _get_gripper_action_for_logging(self) -> float:
         if self._last_gripper_distance_cmd is not None:
-            return float(self._last_gripper_distance_cmd)
-        return float(self._target_gripper_distance_mm)
+            return self._clip_gripper_mm_for_log(self._last_gripper_distance_cmd)
+        return self._clip_gripper_mm_for_log(self._target_gripper_distance_mm)
 
     def _get_gripper_observation_for_logging(self) -> float:
         if self.arm is not None:
             feedback_mm = self.arm.get_gripper_distance_mm()
             if feedback_mm is not None:
-                return float(feedback_mm)
+                return self._clip_gripper_mm_for_log(feedback_mm)
         if self._last_gripper_distance_cmd is not None:
-            return float(self._last_gripper_distance_cmd)
-        return float(self.gripper_observation_default)
+            return self._clip_gripper_mm_for_log(self._last_gripper_distance_cmd)
+        return self._clip_gripper_mm_for_log(self.gripper_observation_default)
 
     def _get_robot_state_for_logging(self) -> Dict:
         gripper_action = self._get_gripper_action_for_logging()
@@ -1519,7 +1541,7 @@ class TB6R5TeleopController(HardwareTeleopController):
         action = np.concatenate([action_joints, np.array([gripper_action], dtype=float)])
 
         state = {
-            # 7-D vectors: 6 arm joints (rad) + gripper distance (mm).
+            # 7-D vectors: 6 arm joints (rad) + gripper distance (mm, never [0, 1] normalized).
             # action[6] = commanded distance (mm); observation.state[6] = actual_pos feedback (mm).
             "observation": observation,
             "action": action,
@@ -1577,23 +1599,61 @@ class TB6R5TeleopController(HardwareTeleopController):
     # Camera (optional)
     # ------------------------------------------------------------------
 
-    def _initialize_camera(self):
-        if self.enable_camera:
-            print("[TB6R5] Initializing RealSense cameras...")
-            try:
-                from xrobotoolkit_teleop.hardware.interface.realsense import RealSenseCameraInterface
+    def _camera_logical_names(self) -> list[str]:
+        if self.camera_urls or self.camera_devices:
+            from xrobotoolkit_teleop.common.camera_streams import create_camera_stream
 
-                self.camera_interface = RealSenseCameraInterface(
+            _, names, _ = create_camera_stream(
+                camera_urls=self.camera_urls,
+                camera_devices=self.camera_devices,
+                camera_serial_dict=self.camera_serial_dict,
+                width=self.camera_width,
+                height=self.camera_height,
+                fps=self.camera_fps,
+            )
+            return names
+        return sorted(self.camera_serial_dict.keys())
+
+    def _initialize_camera(self):
+        if not self.enable_camera:
+            return
+        if self.camera_urls or self.camera_devices:
+            print(f"[TB6R5] Initializing cameras ({'HTTP' if self.camera_urls else 'V4L2'})...")
+            try:
+                from xrobotoolkit_teleop.common.camera_streams import FlexibleCameraInterface
+
+                self.camera_interface = FlexibleCameraInterface(
+                    camera_serial_dict=self.camera_serial_dict,
+                    camera_devices=self.camera_devices,
+                    camera_urls=self.camera_urls,
                     width=self.camera_width,
                     height=self.camera_height,
                     fps=self.camera_fps,
-                    serial_numbers=list(self.camera_serial_dict.values()),
-                    enable_depth=self.enable_camera_depth,
                     enable_compression=self.enable_camera_compression,
                     jpg_quality=self.camera_jpg_quality,
                 )
                 self.camera_interface.start()
-                print(f"[TB6R5] RealSense cameras ready: {list(self.camera_serial_dict.keys())}")
+                print(f"[TB6R5] Cameras ready ({self.camera_interface.backend}): {self.camera_interface.camera_names}")
             except Exception as e:
-                print(f"[TB6R5] Error initializing RealSense cameras: {e}")
+                print(f"[TB6R5] Error initializing cameras: {e}")
                 self.camera_interface = None
+            return
+
+        print("[TB6R5] Initializing RealSense cameras...")
+        try:
+            from xrobotoolkit_teleop.hardware.interface.realsense import RealSenseCameraInterface
+
+            self.camera_interface = RealSenseCameraInterface(
+                width=self.camera_width,
+                height=self.camera_height,
+                fps=self.camera_fps,
+                serial_numbers=list(self.camera_serial_dict.values()),
+                enable_depth=self.enable_camera_depth,
+                enable_compression=self.enable_camera_compression,
+                jpg_quality=self.camera_jpg_quality,
+            )
+            self.camera_interface.start()
+            print(f"[TB6R5] RealSense cameras ready: {list(self.camera_serial_dict.keys())}")
+        except Exception as e:
+            print(f"[TB6R5] Error initializing RealSense cameras: {e}")
+            self.camera_interface = None

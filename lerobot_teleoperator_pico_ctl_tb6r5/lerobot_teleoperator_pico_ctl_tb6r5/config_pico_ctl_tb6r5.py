@@ -18,6 +18,7 @@ class PicoCtlTB6R5Config(TeleoperatorConfig):
     require_grip_to_send_commands: bool = True
     require_joystick_arm: bool = False
     gripper_max_d: float = 70.0
+    gripper_min_d: float = 0.0
     two_fingers_gripper_interval: float = 25.0
     two_fingers_gripper_cmd_delta: float = 5.0
     safe_tcp_z_min_m: Optional[float] = 0.05

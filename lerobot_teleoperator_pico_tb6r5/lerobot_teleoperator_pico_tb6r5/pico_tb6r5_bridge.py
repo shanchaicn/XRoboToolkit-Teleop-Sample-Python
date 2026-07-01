@@ -120,6 +120,7 @@ class PicoTB6R5LeRobotBridge(TB6R5TeleopController):
         self._target_gripper_distance_mm = TB6R5Interface.gripper_distance_from_trigger(
             trigger,
             self.gripper_max_d,
+            self.gripper_min_d,
         )
 
     def _is_gripper_trigger_active(self) -> bool:

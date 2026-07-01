@@ -1,5 +1,7 @@
 # TB6-R5 ACT 模型部署指南（评估 → Dry-Run → 真机）
 
+> **观测 / 动作 / CLI 接口详解**见 [docs/ACT_Policy_Infer_Interface.md](docs/ACT_Policy_Infer_Interface.md)。
+
 本文档说明如何把 LeRobot 训练出的 ACT 模型部署到 TB6-R5 机器人。
 所有命令在项目根目录 `~/study/XRoboToolkit-Teleop-Sample-Python` 下运行，并已激活 `pico` 环境。
 
@@ -17,11 +19,8 @@ conda activate pico
 
 | 资源 | 路径 | 说明 |
 |---|---|---|
-| 模型 040000（本地） | `model/act_tb6r5_yellow_yogurt/checkpoints/040000/pretrained_model` | 单独下载的最终 checkpoint |
-| 模型 020000（HF 缓存） | `~/.cache/huggingface/hub/models--shanchai--act_tb6r5_yellow_yogurt/snapshots/<hash>/checkpoints/020000/pretrained_model` | `hf download` 下载的早期 checkpoint |
+| ACT 模型（080000） | `model/act/080000/pretrained_model` | 基于 v3 数据集训练的 checkpoint |
 | v3 数据集 | `data/lerobot/tb6r5_yellow_yogurt_47_v3` | 47 集 / 51829 帧，repo_id `shanchai/tb6r5_yellow_yogurt_47_v3` |
-
-`<hash>` 当前是 `ec25f5eaf99845e8dea1d66f8a39615c741b492b`。下面命令用 `$(ls -d ...)` 自动展开，无需手填。
 
 > 关键：LeRobot `from_pretrained` 需要的是 **`pretrained_model` 目录**（含
 > `config.json` / `model.safetensors` / `policy_preprocessor*.json` /
@@ -35,21 +34,50 @@ conda activate pico
 模型 `config.json` 要求的输入特征：
 
 - `observation.state`：7 维 = `[q0..q5, gripper_mm]`
-  - 前 6 维是机械臂关节角（弧度），真机时从机器人读取
+  - 前 6 维是机械臂关节角（弧度），真机时从机器人 Topic 读取
   - 第 7 维 `gripper_mm` 是 YS 夹爪 **actual_pos 反馈（mm）**，0=全闭合，70=全开
-- `observation.images.realsense_0`：RGB，480×640×3，相机序列号 `135522071053`
-- `observation.images.realsense_1`：RGB，480×640×3，相机序列号 `327122073649`
-
+- `observation.images.realsense_0`：RGB，480×640×3，RealSense 序列号 `135522071053`
+- `observation.images.realsense_1`：RGB，480×640×3，RealSense 序列号 `347622071274`
 输出动作 `action`：7 维 = `[q0..q5, gripper_mm]`
 
 - 前 6 维是关节目标角（弧度）
-- 第 7 维 `gripper_mm` 是**夹爪指令距离（mm）**，0=全闭合，`gripper_max_distance`=全开（默认 70）
+- 第 7 维 `gripper_mm` 是**夹爪指令距离（mm）**，0=全闭合，`--gripper-max-distance`=全开（默认 70）
+- 真机 SubLoop1 与数据集写入均使用 **mm**，不做 [0, 1] 归一化（LeRobot 训练时的 MEAN_STD 由框架自动处理）
 - 真机通过 **SubLoop1** 合并下发：`JogAnyJ` + `MoveTwoFingersGripper`
-- 遥操作采集：`right_trigger` 控制距离（按下=闭合，松开=张开），不再使用摇杆
-
-**注意：** 旧数据集（13mm + 归一化 [0,1] + 无夹爪反馈）与新 pipeline 不兼容，需重新采集并训练。
+- 遥操作采集：`right_trigger` 控制距离（按下=闭合，松开=张开）
 
 模型权重已烘焙归一化统计，**推理和评估都无需依赖数据集**（数据集仅用于离线对比 MAE）。
+
+### 1.1 相机接入模式（采集与推理共用）
+
+LeRobot 特征名固定为 `observation.images.realsense_0` / `realsense_1`（逻辑名须与训练一致），
+物理相机可通过三种方式绑定（优先级：**URL > V4L2 > RealSense 序列号**）：
+
+| 模式 | 参数 | 依赖 | 典型场景 |
+|------|------|------|----------|
+| **RealSense USB** | `--camera-serials` 或 `--camera-serial-dict.*` | `pyrealsense2` | 本机直连 RealSense |
+| **V4L2 `/dev/video*`** | `--camera-devices` | OpenCV | TER30、`libusb` 异常、UVC 节点 |
+| **HTTP URL** | `--camera-urls` | 标准库 + OpenCV | 远程 `RsCameraSensor`、无本地 USB |
+
+格式均为逗号分隔的 `逻辑名=绑定`：
+
+```bash
+# RealSense（推理 policy_infer / 采集 teleop 默认）
+--camera-serials 'realsense_0=135522071053,realsense_1=347622071274'
+
+# V4L2（OpenCV VideoCapture，可用数字索引）
+--camera-devices 'realsense_0=/dev/video0,realsense_1=/dev/video4'
+
+# HTTP（GET 返回 JPEG/PNG 或 multipart 流）
+--camera-urls 'realsense_0=http://192.168.2.42:8888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.42:8888/RsCameraSensor/1/0/color'
+```
+
+共用分辨率参数：`--camera-width`（640）、`--camera-height`（480）、`--camera-fps`（30）。
+V4L2 模式下用 `v4l2-ctl --list-devices` 确认 **RGB 采集节点**（RealSense 会暴露多个 `/dev/video*`）。
+查 RealSense SN：`rs-enumerate-devices | grep "Serial Number"`。
+
+实现见 `scripts/hardware/policy_infer_tb6r5_act.py` 与共享模块
+`xrobotoolkit_teleop/common/camera_streams.py`（方案 A 采集脚本同样支持 `--camera-devices` / `--camera-urls`）。
 
 ---
 
@@ -82,7 +110,10 @@ pip install -e ./lerobot_teleoperator_pico_ctl_tb6r5 --no-deps # B2
 输出目录默认 `data/lerobot/tb6r5_live`。
 
 #### 推荐命令
-
+rs现在有的序列号
+244222075136
+135522071053
+347622071274
 ```bash
 python scripts/hardware/teleop_tb6r5_hardware.py \
   --robot-ip 192.168.11.11 \
@@ -91,12 +122,15 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
   --scale-factor 1.5 \
   --zone-ratio 0.00 \
   --gripper-max-d 70 \
+  --gripper-min-d 30 \
   --enable-log-data \
   --enable-camera \
+  --camera-serial-dict.realsense-0 135522071053 \
+  --camera-serial-dict.realsense-1 244222075136 \
   --enable-lerobot-log \
-  --lerobot-root data/lerobot/tb6r5_live \
-  --lerobot-repo-id local/tb6r5_live \
-  --lerobot-task "tb6r5 teleoperation" \
+  --lerobot-root data/lerobot/tb6r5_new \
+  --lerobot-repo-id local/tb6r5_new \
+  --lerobot-task "tb6r5 teleoperation 3 rings" \
   --lerobot-streaming-encoding \
   --lerobot-overwrite \
   --lerobot-image-writer-processes 0 \
@@ -107,6 +141,34 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
 
 > `--lerobot-overwrite` 会删除已有 `data/lerobot/tb6r5_live` 后重建。续采请改
 > `--lerobot-resume`（去掉 overwrite）。
+
+#### 采集：V4L2 相机（无 pyrealsense2）
+
+```bash
+python scripts/hardware/teleop_tb6r5_hardware.py \
+  --robot-ip 192.168.11.11 \
+  --enable-log-data --enable-camera --no-enable-camera-depth \
+  --camera-devices 'realsense_0=/dev/video0,realsense_1=/dev/video4' \
+  --enable-lerobot-log \
+  --lerobot-root data/lerobot/tb6r5_live \
+  --lerobot-repo-id local/tb6r5_live \
+  --lerobot-streaming-encoding
+```
+
+#### 采集：HTTP 远程相机
+
+```bash
+python scripts/hardware/teleop_tb6r5_hardware.py \
+  --robot-ip 192.168.11.11 \
+  --enable-log-data --enable-camera --no-enable-camera-depth \
+  --camera-urls 'realsense_0=http://192.168.2.42:8888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.42:8888/RsCameraSensor/1/0/color' \
+  --enable-lerobot-log \
+  --lerobot-root data/lerobot/tb6r5_live \
+  --lerobot-repo-id local/tb6r5_live
+```
+
+> 设置 `--camera-urls` 或 `--camera-devices` 后忽略 `--camera-serial-dict.*`。
+> V4L2/HTTP 模式不支持 depth（请保持 `--no-enable-camera-depth`、勿加 `--lerobot-include-depth`）。
 
 ### 2.2 VR 手柄操作
 
@@ -194,6 +256,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 |------|--------|------|
 | `--gripper-trigger-name` | `right_trigger` | 夹爪映射键（按下=闭合，松开=张开） |
 | `--gripper-max-d` | `70.0` | 最大张开距离（mm），须与训练一致 |
+| `--gripper-min-d` | `0.0` | 最小距离 / 全闭合（mm），须与训练一致 |
 | `--two-fingers-gripper-interval` | `5.0` | `MoveTwoFingersGripper` interval |
 | `--gripper-observation-default` | `0.0` | 无反馈时的夹爪观测默认值 |
 | `--disable-gripper` | off | 禁用夹爪控制 |
@@ -204,22 +267,30 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--enable-camera` | on | 启用 RealSense（`enable-log-data` 时默认可开） |
+| `--enable-camera` | on | 启用相机（`enable-log-data` 时默认可开） |
 | `--camera-width` | `640` | 图像宽 |
 | `--camera-height` | `480` | 图像高 |
 | `--camera-fps` | `30` | 相机帧率 |
-| `--enable-camera-depth` | on | 预览/日志是否读 depth；数据集用 `--no-lerobot-include-depth` |
+| `--enable-camera-depth` | on | 预览/日志是否读 depth（仅 RealSense；V4L2/HTTP 无 depth） |
 | `--enable-camera-compression` | on | 日志 JPG 压缩 |
 | `--camera-jpg-quality` | `85` | JPG 质量 |
 
-**`--camera-serial-dict.*`（逻辑名→序列号，非自动检测）**
+**三种绑定方式（互斥，优先级 URL > V4L2 > RealSense）**
+
+| 参数 | 示例 | 说明 |
+|------|------|------|
+| `--camera-serial-dict.*` | `realsense-0=135522071053` | RealSense 序列号（tyro 字典写法） |
+| `--camera-devices` | `realsense_0=/dev/video0,realsense_1=4` | V4L2 设备路径或数字索引 |
+| `--camera-urls` | `realsense_0=http://host:8888/.../color` | HTTP GET JPEG/PNG 或 multipart 流 |
+
+**`--camera-serial-dict.*` 默认值（未指定 devices/urls 时）**
 
 | 参数 | 默认值 |
 |------|--------|
 | `--camera-serial-dict.realsense-0` | `135522071053` |
-| `--camera-serial-dict.realsense-1` | `327122073649` |
+| `--camera-serial-dict.realsense-1` | `347622071274` |
 
-换机查序列号：`rs-enumerate-devices | grep "Serial Number"`。
+逻辑名必须为 `realsense_0` / `realsense_1`，与 LeRobot 数据集字段一致。详见 §1.1。
 
 #### 数据记录（pkl / LeRobot）
 
@@ -562,23 +633,19 @@ lerobot-dataset-viz \
 在真机前，先用数据集对比"模型预测动作"与"真实动作"的 MAE。
 
 ```bash
-# 用 040000（本地）评估
 python scripts/misc/eval_act_on_lerobot_tb6r5.py \
-  --policy-path model/act_tb6r5_yellow_yogurt/checkpoints/040000/pretrained_model \
+  --policy-path model/act/080000/pretrained_model \
   --dataset-root data/lerobot/tb6r5_yellow_yogurt_47_v3 \
   --repo-id shanchai/tb6r5_yellow_yogurt_47_v3 \
   --device cuda \
   --max-samples 200 \
   --stride 50
 ```
-
 ```bash
-# 用 020000（HF 缓存）评估
-CKPT=$(ls -d ~/.cache/huggingface/hub/models--shanchai--act_tb6r5_yellow_yogurt/snapshots/*/checkpoints/020000/pretrained_model)
 python scripts/misc/eval_act_on_lerobot_tb6r5.py \
-  --policy-path "$CKPT" \
-  --dataset-root data/lerobot/tb6r5_yellow_yogurt_47_v3 \
-  --repo-id shanchai/tb6r5_yellow_yogurt_47_v3 \
+  --policy-path model/P02/060000/pretrained_model\
+  --dataset-root data/lerobot/tb6r5_rings/P02 \
+  --repo-id shanchai/tb6r5_rings_P02 \
   --device cuda \
   --max-samples 200 \
   --stride 50
@@ -589,8 +656,7 @@ python scripts/misc/eval_act_on_lerobot_tb6r5.py \
 - `--max-samples`：评估样本数上限
 - `--stride`：每隔多少帧取一个样本（脚本会对每个样本 `policy.reset()`，保证逐样本独立）
 
-参考结果（020000，30 样本）：`MAE(all) ≈ 0.0117`，各关节 MAE ≈ 0.006–0.020 rad（约 0.3–1.2°），
-夹爪 MAE ≈ 0.012。**MAE 越低越好**；若某维 MAE 明显偏大，说明该自由度学习不充分。
+`action[6]` 为夹爪距离（mm）。**MAE 越低越好**；若某维 MAE 明显偏大，说明该自由度学习不充分。
 
 ---
 
@@ -605,7 +671,7 @@ python scripts/misc/eval_act_on_lerobot_tb6r5.py \
 ```bash
 python scripts/hardware/policy_infer_tb6r5_act.py \
   --robot-ip 0.0.0.0 \
-  --policy-path model/act_tb6r5_yellow_yogurt/checkpoints/040000/pretrained_model \
+  --policy-path model/act/080000/pretrained_model \
   --device cuda \
   --fps 5 \
   --no-camera \
@@ -620,13 +686,18 @@ python scripts/hardware/policy_infer_tb6r5_act.py \
 ```bash
 python scripts/hardware/policy_infer_tb6r5_act.py \
   --robot-ip 192.168.11.11 \
-  --policy-path model/act_tb6r5_yellow_yogurt/checkpoints/040000/pretrained_model \
+  --policy-path model/act/080000/pretrained_model \
   --device cuda \
-  --fps 20 \
+  --fps 30 \
+  --arm-rpc-rate-hz 30 \
+  --gripper-rpc-rate-hz 2 \
+  --gripper-min-distance 30 \
   --gripper-max-distance 70 \
-  --gripper-interval 25 \
+  --gripper-interval 5 \
+  --temporal-ensemble-coeff 0.01 \
+  --camera-serials 'realsense_0=135522071053,realsense_1=347622071274' \
   --dry-run \
-  --print-every 0.5
+  --print-every 0.2
 ```
 
 打印含义：
@@ -634,9 +705,29 @@ python scripts/hardware/policy_infer_tb6r5_act.py \
 - `q_cur`：当前关节角（dry-run 下机器人未连接，恒为 0）
 - `q_tgt`：模型预测的关节目标
 - `q_cmd`：经每步限速钳制后的实际下发值（`--joint-step-max-rad` 默认 0.03 rad/步）
-- `cmd` / `obs`：夹爪指令/反馈距离（mm，0=闭合，70=张开）
+- `cmd` / `obs`：夹爪指令/反馈距离（mm，**30=闭合，70=张开**）
 
-确认 `q_tgt` 落在合理关节范围、夹爪 mm 在 0–70 之间，再上真机。
+确认 `q_tgt` 落在合理关节范围、夹爪 mm 在 30–70 之间，再上真机。
+
+#### Dry-Run：V4L2 相机
+
+```bash
+python scripts/hardware/policy_infer_tb6r5_act.py \
+  --robot-ip 192.168.11.11 \
+  --policy-path model/act/080000/pretrained_model \
+  --camera-devices 'realsense_0=/dev/video0,realsense_1=/dev/video4' \
+  --dry-run --fps 30 --arm-rpc-rate-hz 30 --gripper-rpc-rate-hz 2 --temporal-ensemble-coeff 0.01
+```
+
+#### Dry-Run：HTTP 远程相机
+
+```bash
+python scripts/hardware/policy_infer_tb6r5_act.py \
+  --robot-ip 192.168.11.11 \
+  --policy-path model/act/080000/pretrained_model \
+  --camera-urls 'realsense_0=http://192.168.2.42:8888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.42:8888/RsCameraSensor/1/0/color' \
+  --dry-run --fps 30 --arm-rpc-rate-hz 30 --gripper-rpc-rate-hz 2 --temporal-ensemble-coeff 0.01
+```
 
 ---
 
@@ -647,29 +738,175 @@ python scripts/hardware/policy_infer_tb6r5_act.py \
 ```bash
 python scripts/hardware/policy_infer_tb6r5_act.py \
   --robot-ip 192.168.11.11 \
-  --policy-path model/act_tb6r5_yellow_yogurt/checkpoints/040000/pretrained_model \
+  --policy-path model/P02/060000/pretrained_model \
+  --task "Pick up the yellow ring and place it on the white plate." \
   --device cuda \
-  --fps 20 \
+  --fps 30 \
+  --arm-rpc-rate-hz 30 \
+  --gripper-rpc-rate-hz 2 \
   --joint-step-max-rad 0.03 \
+  --gripper-min-distance 30 \
   --gripper-max-distance 70 \
-  --gripper-interval 25
+  --gripper-interval 5 \
+  --temporal-ensemble-coeff 0.01 \
+  --camera-serials 'realsense_0=135522071053,realsense_1=244222075136'
 ```
 
-真机参数：
+> `--temporal-ensemble-coeff 0.01` 与 `--n-action-steps` / `--refresh-policy-every-step` 互斥，三选一即可。  
+> 若不用 temporal ensemble，可改为例如 `--n-action-steps 10`（须 ≤ checkpoint 的 `chunk_size`）。
+
+旧模型示例（参数同上，仅换 `--policy-path` / `--task` / 相机序列号）：
+
+```bash
+python scripts/hardware/policy_infer_tb6r5_act.py \
+  --robot-ip 192.168.11.11 \
+  --policy-path model/act/080000/pretrained_model \
+  --device cuda \
+  --fps 30 \
+  --arm-rpc-rate-hz 30 \
+  --gripper-rpc-rate-hz 2 \
+  --joint-step-max-rad 0.03 \
+  --gripper-min-distance 30 \
+  --gripper-max-distance 70 \
+  --gripper-interval 5 \
+  --temporal-ensemble-coeff 0.01 \
+  --camera-serials 'realsense_0=135522071053,realsense_1=347622071274'
+```
+
+打包 CLI 等价写法：
+
+```bash
+tb6r5-policy-infer \
+  --robot-ip 192.168.11.11 \
+  --policy-path model/act/080000/pretrained_model \
+  --device cuda \
+  --fps 30 \
+  --arm-rpc-rate-hz 30 \
+  --gripper-rpc-rate-hz 2 \
+  --joint-step-max-rad 0.03 \
+  --gripper-min-distance 30 \
+  --gripper-max-distance 70 \
+  --gripper-interval 5 \
+  --temporal-ensemble-coeff 0.01 \
+  --camera-serials 'realsense_0=135522071053,realsense_1=347622071274'
+```
+
+### 6.1 基础真机参数（与 `record_tb6r5_lerobot.sh` 对齐）
+
+| 采集脚本变量 | 部署参数 | 默认值 / 说明 |
+|-------------|----------|----------------|
+| `CONTROL_RATE_HZ=30` | `--fps` | **30** |
+| 臂 SubLoop1 RPC | `--arm-rpc-rate-hz` | **30 Hz**（与 `--fps` 一致，每步发臂） |
+| 夹爪 SubLoop1 RPC | `--gripper-rpc-rate-hz` | **2 Hz**（30Hz 控制下每 15 步更新夹爪） |
+| `GRIPPER_MAX_D=70` | `--gripper-max-distance` | 70 mm |
+| `GRIPPER_MIN_D=30` | `--gripper-min-distance` | **30 mm**（闭合限位，非 0） |
+| `MoveTwoFingersGripper --interval` | `--gripper-interval` | 5 |
+| 遥操作 home | `--home-joint-deg` | **80 -70 70 -90 -90 -60**（与采集一致） |
+| `LEROBOT_TASK` | `--task` | 须与训练/采集任务字符串一致 |
+
+**ACT 推理调参（§6.2，命令行三选一）：**
+
+| 参数 | 说明 |
+|------|------|
+| `--temporal-ensemble-coeff 0.01` | 推荐：每步推理 + 时间集成，更跟手 |
+| `--n-action-steps N` | 每 N 控制步重推理（不用 temporal ensemble 时） |
+| `--refresh-policy-every-step` | 每步 `policy.reset()` 重推理（调试用最激进） |
 
 - `--robot-ip` / `--rpc-port`：机器人地址（RPC 端口默认 5868）
-- `--fps`：控制频率，首次建议先低（如 10）观察后再提高
 - `--joint-step-max-rad`：每步关节最大变化量，越小越慢越安全（默认 0.03 rad）
-- `--gripper-max-distance`：夹爪最大张开距离（mm），必须与训练一致（YS 默认 70）
-- `--gripper-interval`：`MoveTwoFingersGripper` 的 interval（默认 25）
 - `--gripper-cmd-delta`：夹爪距离变化小于该值（mm）时跳过 SubLoop1 重发（默认 0.5）
+- `--device`：推理设备 `cuda` / `cpu`（`tb6r5-policy-infer` 还支持 `auto`）
 
-相机相关（一般用默认即可）：
+相机相关（详见 §1.1；与 `policy_infer_tb6r5_act.py` 参数一致）：
 
-- `--camera-serials`：覆盖默认序列号映射，格式
-  `realsense_0=135522071053,realsense_1=327122073649`
+- **RealSense（默认）** `--camera-serials`：`realsense_0=135522071053,realsense_1=347622071274`
+- **V4L2** `--camera-devices`：`realsense_0=/dev/video0,realsense_1=/dev/video4`（或 `realsense_1=4`）
+- **HTTP URL** `--camera-urls`：远程 JPEG/PNG 快照或流式 URL
+- 优先级：`--camera-urls` > `--camera-devices` > `--camera-serials`
 - `--camera-width/height/fps`：默认 640×480×30
 - `--no-camera`：跳过相机喂黑图（**仅调试**，真机请勿使用）
+
+完整 ACT 观测/动作接口见 [docs/ACT_Policy_Infer_Interface.md](docs/ACT_Policy_Infer_Interface.md)。
+
+### 6.2 ACT 动作块与重推理（chunk / n_action_steps）
+
+ACT 一次前向会预测 **`chunk_size` 步**动作（存在 checkpoint 的 `config.json` 里，推理时只读不改）。
+默认部署使用 **`n_action_steps`**：从 chunk 中按序取出若干步执行，**每执行完 `n_action_steps` 个控制步**再重新推理一次。
+
+| 概念 | 说明 |
+|------|------|
+| `chunk_size` | 单次推理输出的动作序列长度（训练/ checkpoint 固定） |
+| `n_action_steps` | 每次推理后，连续执行多少步再重推理（≤ `chunk_size`） |
+| 控制步 | 由 `--fps` 决定；每步读观测、从队列取 1 个 action 下发机器人 |
+
+启动时日志会打印当前 `chunk_size` / `n_action_steps`；调试行里 `chunk=2/50` 表示队列中第 2 步 / 共 50 步。
+
+**调参目标（无需重新训练）：**
+
+- 觉得**反应慢、跟不上环境变化** → 减小 `n_action_steps` 或启用时间集成（见下）
+- 觉得**抖动、动作碎** → 增大 `n_action_steps`（更接近训练默认）
+
+#### `--n-action-steps N`
+
+覆盖 checkpoint 里的 `n_action_steps`（合法范围 **1 … chunk_size**）。
+
+```bash
+tb6r5-policy-infer \
+  --robot-ip 192.168.11.11 \
+  --policy-path model/act/080000/pretrained_model \
+  --n-action-steps 10 \
+  --fps 20
+```
+
+示例：若 `chunk_size=50`、训练时 `n_action_steps=50`，改为 `--n-action-steps 10` 后每 **10 个控制步**（约 0.5 s @20Hz）重新采图推理一次，比默认更灵敏。
+
+#### `--temporal-ensemble-coeff COEFF`
+
+启用 ACT 论文中的 **Temporal Ensemble**（原论文常用 **0.01**）。**每个控制步都推理**，并把当前 chunk 与历史重叠预测做指数融合，通常比单纯减小 `n_action_steps` 更平滑。
+
+```bash
+tb6r5-policy-infer \
+  --robot-ip 192.168.11.11 \
+  --policy-path model/act/080000/pretrained_model \
+  --temporal-ensemble-coeff 0.01 \
+  --fps 20
+```
+
+- 设置后内部强制 `n_action_steps=1`（每步推理）
+- `COEFF` 越小，融合越偏向历史（更平滑）；越大越跟当前预测（更灵敏）
+- **不要**与 `--refresh-policy-every-step` 同时使用
+
+#### `--refresh-policy-every-step`
+
+每个控制步调用 `policy.reset()` 并重新推理（清空 ACT 内部 action queue，**不算** temporal ensemble）。
+
+```bash
+tb6r5-policy-infer \
+  --robot-ip 192.168.11.11 \
+  --policy-path model/act/080000/pretrained_model \
+  --refresh-policy-every-step \
+  --fps 15
+```
+
+- 最灵敏，但计算最重，动作可能不如 ensemble 平滑
+- 与 `--temporal-ensemble-coeff` **互斥**
+
+#### 三种模式对比
+
+| 模式 | 参数 | 何时重推理 | 适用场景 |
+|------|------|------------|----------|
+| **默认队列** | （不传） | 每 `n_action_steps` 步 | 与训练部署一致 |
+| **缩短队列** | `--n-action-steps N` | 每 `N` 步 | 轻量加速反应，无需每步 GPU |
+| **时间集成** | `--temporal-ensemble-coeff 0.01` | **每步** | 推荐尝试：更平滑的每步反应 |
+| **强制每步重推** | `--refresh-policy-every-step` | **每步**（无 ensemble） | 调试 / 极端要跟手 |
+
+真机首次建议：**先用 checkpoint 默认**，仍慢再加 `--n-action-steps 10`，仍不满意再试 `--temporal-ensemble-coeff 0.01`。
+
+### 6.3 复位与其它
+
+- `--home-joint-deg`：启动与 Ctrl+C 退出时的复位关节（度，默认与遥操作 home 一致）
+- `--no-home-on-start` / `--no-home-on-exit`：跳过启动或退出复位
+- `--gripper-normalized`：仅 `tb6r5-policy-infer`；**仅当历史数据集 action/state 第 7 维已是 [0, 1] 时**才启用（v3 pipeline 默认 mm，不要加）
 
 按 `Ctrl+C` 停止，脚本会自动停相机线程并 `disable()` 机器人。
 
@@ -794,8 +1031,9 @@ python scripts/hardware/test_direct_single_rpc.py --dry-run --mode gripper
 - [ ] 先离线评估，确认 MAE 合理
 - [ ] 再 dry-run（最好带真实相机），确认 `q_tgt` / 夹爪 mm 合理
 - [ ] 真机首次用低 `--fps`（如 10）+ 默认 `--joint-step-max-rad 0.03`
+- [ ] ACT 反应慢时按 §6.2 尝试 `--n-action-steps` 或 `--temporal-ensemble-coeff 0.01`（勿与 `--refresh-policy-every-step` 混用 ensemble）
 - [ ] 机器人工作空间清空，急停在手边
-- [ ] 相机序列号、`--gripper-max-distance` 与训练数据完全一致
+- [ ] 相机序列号、`--gripper-max-distance` 与训练数据完全一致（夹爪第 7 维为 mm，非 [0, 1]）
 
 ---
 

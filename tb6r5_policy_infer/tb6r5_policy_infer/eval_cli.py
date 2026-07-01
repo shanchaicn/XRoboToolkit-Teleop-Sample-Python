@@ -11,6 +11,7 @@ Offline evaluation for a trained ACT policy on an existing LeRobot TB6-R5 datase
 
 Metric:
   - action MAE (overall + per-dimension) between policy prediction and dataset action.
+  - inference latency / FPS (printed after eval; use --benchmark-only for a dedicated speed test).
 
 This helps validate deployment readiness before hardware rollout.
 """
@@ -29,6 +30,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-samples", type=int, default=1000, help="Maximum number of samples to evaluate")
     parser.add_argument("--stride", type=int, default=5, help="Evaluate every N-th sample")
+    parser.add_argument(
+        "--warmup-samples",
+        type=int,
+        default=10,
+        help="Warmup inferences excluded from FPS stats (default: 10)",
+    )
+    parser.add_argument(
+        "--benchmark-only",
+        action="store_true",
+        help="Only measure inference speed (skip MAE and plots)",
+    )
+    parser.add_argument(
+        "--bench-samples",
+        type=int,
+        default=200,
+        help="Number of timed inferences in --benchmark-only mode (default: 200)",
+    )
     parser.add_argument(
         "--output-dir",
         default=None,

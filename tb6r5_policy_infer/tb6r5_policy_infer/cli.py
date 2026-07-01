@@ -4,23 +4,32 @@ from __future__ import annotations
 
 import argparse
 
-from .constants import DEFAULT_GRIPPER_MAX_D, DEFAULT_HOME_JOINT_DEG, DEFAULT_HOME_SETTLE_TIME_S
-from .runner import run_inference
+from .constants import (
+    DEFAULT_ARM_RPC_RATE_HZ,
+    DEFAULT_CONTROL_FPS,
+    DEFAULT_GRIPPER_MAX_D,
+    DEFAULT_GRIPPER_MIN_D,
+    DEFAULT_GRIPPER_RPC_RATE_HZ,
+    DEFAULT_HOME_JOINT_DEG,
+    DEFAULT_HOME_SETTLE_TIME_S,
+    DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA,
+    DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+)
 
 _DOC = """
 Run a trained LeRobot ACT policy on TB6-R5 hardware.
 
 This follows the official LeRobot inference flow:
   - load policy + pre/post processors from a pretrained checkpoint
-  - build observation dict (state + RealSense camera images)
+  - build observation dict (state + camera images: RealSense SN, V4L2, or HTTP URL)
   - predict action
   - apply robot-side safety limits
   - send command to TB6-R5
 
 Observation / action layout (must match the training dataset):
-  - observation.state : [q0..q5, gripper_mm]  (7-D)
+  - observation.state : [q0..q5, gripper]  (7-D; gripper in mm or [0,1] with --gripper-normalized)
   - observation.images.realsense_0 / realsense_1 : RGB HWC uint8 (480x640x3)
-  - action : [q0..q5, gripper_mm]  (7-D)
+  - action : [q0..q5, gripper]  (7-D; same unit as training)
 
 On start and Ctrl+C exit the arm moves to --home-joint-deg via SubLoop1 (MoveAbsJ + open gripper).
 
@@ -49,8 +58,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Inference device: auto (default), cuda, or cpu. Falls back to CPU if CUDA is unavailable.",
     )
-    parser.add_argument("--fps", type=float, default=20.0, help="Control loop frequency")
+    parser.add_argument("--fps", type=float, default=DEFAULT_CONTROL_FPS, help="Control loop frequency (record script: 30)")
     parser.add_argument("--joint-step-max-rad", type=float, default=0.03, help="Per-step joint delta clamp (rad)")
+    parser.add_argument(
+        "--arm-rpc-rate-hz",
+        type=float,
+        default=DEFAULT_ARM_RPC_RATE_HZ,
+        help="Arm SubLoop1 RPC rate in Hz (default 30, match --fps)",
+    )
+    parser.add_argument(
+        "--gripper-rpc-rate-hz",
+        type=float,
+        default=DEFAULT_GRIPPER_RPC_RATE_HZ,
+        help="Gripper SubLoop1 update rate in Hz (default 2)",
+    )
     parser.add_argument(
         "--gripper-observation-constant",
         type=float,
@@ -61,13 +82,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--gripper-max-distance",
         type=float,
         default=DEFAULT_GRIPPER_MAX_D,
-        help="Gripper max open distance in mm (must match data collection, default 70)",
+        help="Gripper max open distance in mm (record script GRIPPER_MAX_D, default 70)",
     )
-    parser.add_argument("--gripper-interval", type=float, default=5.0, help="MoveTwoFingersGripper interval")
+    parser.add_argument(
+        "--gripper-min-distance",
+        type=float,
+        default=DEFAULT_GRIPPER_MIN_D,
+        help="Gripper min distance in mm (record script GRIPPER_MIN_D, default 30)",
+    )
+    parser.add_argument(
+        "--gripper-normalized",
+        action="store_true",
+        help=(
+            "Training used gripper in [0,1]: obs.state[6]=feedback_mm/max_distance, "
+            "action[6]=policy_norm*max_distance before sending to robot."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-interval",
+        type=float,
+        default=DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+        help="MoveTwoFingersGripper interval",
+    )
     parser.add_argument(
         "--gripper-cmd-delta",
         type=float,
-        default=0.5,
+        default=DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA,
         help="Minimum gripper distance change (mm) before re-sending SubLoop1 RPC.",
     )
     parser.add_argument(
@@ -77,16 +117,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Map action[6] directly to mm distance (default). Use --no-gripper-continuous for legacy hysteresis.",
     )
     parser.add_argument(
-        "--gripper-close-norm",
+        "--gripper-close-mm",
         type=float,
-        default=0.1,
-        help="Legacy hysteresis: open→close when norm > this (only with --no-gripper-continuous).",
+        default=40.0,
+        help="Legacy hysteresis: latched open→closed when action mm <= this (only with --no-gripper-continuous).",
     )
     parser.add_argument(
-        "--gripper-open-norm",
+        "--gripper-open-mm",
         type=float,
-        default=0.5,
-        help="Legacy hysteresis: close→open when norm < this (only with --no-gripper-continuous).",
+        default=50.0,
+        help="Legacy hysteresis: latched closed→open when action mm >= this (only with --no-gripper-continuous).",
     )
     parser.add_argument(
         "--gripper-edge-min-interval",
@@ -124,24 +164,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--camera-serials",
         default=None,
         help=(
-            "Comma-separated name=serial pairs, e.g. "
+            "RealSense mode: comma-separated name=serial pairs, e.g. "
             "'realsense_0=135522071053,realsense_1=327122073649'. "
-            "Defaults to the teleop serial dict."
+            "Ignored when --camera-devices or --camera-urls is set. Defaults to the teleop serial dict."
+        ),
+    )
+    parser.add_argument(
+        "--camera-devices",
+        default=None,
+        help=(
+            "V4L2 mode: comma-separated name=device pairs, e.g. "
+            "'realsense_0=/dev/video0,realsense_1=/dev/video2' or 'realsense_0=0,realsense_1=2'. "
+            "Ignored when --camera-urls is set. Uses OpenCV VideoCapture (no pyrealsense2)."
+        ),
+    )
+    parser.add_argument(
+        "--camera-urls",
+        default=None,
+        help=(
+            "HTTP mode: comma-separated name=url pairs, e.g. "
+            "'realsense_0=http://192.168.2.42:8888/RsCameraSensor/0/0/color,"
+            "realsense_1=http://192.168.2.42:8888/RsCameraSensor/1/0/color'. "
+            "Each URL is polled via GET; response must be JPEG/PNG image bytes."
         ),
     )
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument(
+        "--camera-preview-fps",
+        type=int,
+        default=30,
+        help="OpenCV preview refresh rate (independent of control loop; default: 30).",
+    )
+    parser.add_argument(
         "--no-camera",
         action="store_true",
-        help="Skip RealSense capture and feed black frames (pipeline test only; outputs are meaningless).",
+        help="Skip camera capture and feed black frames (pipeline test only; outputs are meaningless).",
     )
     parser.add_argument(
         "--show-camera",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Display RealSense RGB preview windows during inference (default: on).",
+        help="Display RGB preview windows during inference (default: on).",
     )
     parser.add_argument("--dry-run", action="store_true", help="Predict and print actions without sending to robot")
     parser.add_argument(
@@ -178,6 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    from .runner import run_inference
+
     args = build_parser().parse_args()
     return run_inference(args)
 

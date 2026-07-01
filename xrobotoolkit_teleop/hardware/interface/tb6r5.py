@@ -28,8 +28,9 @@ DEFAULT_JOG_ANY_JOINT_DEC = 3.0
 # SubLoop1 --immediate: true => abandon the currently-processing exec and run this one now.
 DEFAULT_SUBLOOP1_IMMEDIATE = False
 DEFAULT_JOG_ASYNC_TIMEOUT_MS = 5000000
-# MoveTwoFingersGripper (YS gripper): distance=0 fully closed, distance=max fully open (mm).
+# MoveTwoFingersGripper (YS gripper): distance in mm; teleop maps trigger to [min_d, max_d].
 DEFAULT_GRIPPER_MAX_D = 70.0
+DEFAULT_GRIPPER_MIN_D = 0.0
 DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL = 5.0
 DEFAULT_GRIPPER_CMD_DELTA_MM = 0.5
 DEFAULT_DUAL_MODEL_MOVE_TIMEOUT_MS = 120000
@@ -192,6 +193,52 @@ def _setup_rpc_import():
     _prepend_ld_library_path(target_dir, rpc_root)
 
 
+def validate_robot_sdk(*, require_topic: bool = True) -> None:
+    """Fail fast when RPC/topic binaries are missing or built for the wrong arch/OS."""
+    subdir = _platform_subdir()
+    host = _host_elf_machine()
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    rpc_dir = _rpc_lib_dir()
+    rpc_so = os.path.join(rpc_dir, "rpc.so")
+    if not os.path.isfile(rpc_so):
+        raise RuntimeError(
+            f"Missing RPC library for linux/{subdir} ({host}): {rpc_so}\n"
+            "Copy the vendor rpc_py_all/lib/linux/<arm|x86>/ bundle (rpc.so + deps) "
+            "from the robot SDK package. tb5r6 and tb6r5 use the same binaries."
+        )
+    rpc_elf = _elf_machine(rpc_so)
+    if rpc_elf and rpc_elf != host:
+        raise RuntimeError(
+            f"rpc.so architecture mismatch: file is {rpc_elf}, host is {host} ({rpc_so}). "
+            f"Use lib/linux/{subdir}/ built for this machine."
+        )
+
+    if subdir == "arm" and py_ver != "3.10":
+        print(
+            f"[TB6R5] WARNING: ARM RPC/topic .so files are built for Python 3.10; "
+            f"current interpreter is {py_ver}. Prefer `python3.10` on ARM if `import rpc` fails."
+        )
+
+    if not require_topic:
+        return
+
+    topic_dir = _topic_lib_dir()
+    topic_so = os.path.join(topic_dir, "topic.so")
+    if not os.path.isfile(topic_so):
+        raise RuntimeError(
+            f"Missing topic library for {subdir} ({host}): {topic_so}\n"
+            "Copy topic_all_py/lib/<arm|x86>/ (topic.so, libprotobuf.so.32, libzmq.so*) "
+            "from the robot SDK package."
+        )
+    topic_elf = _elf_machine(topic_so)
+    if topic_elf and topic_elf != host:
+        raise RuntimeError(
+            f"topic.so architecture mismatch: file is {topic_elf}, host is {host} ({topic_so})."
+        )
+    _ensure_topic_protobuf_lib(topic_dir)
+
+
 class TB6R5Interface:
     """Low-level interface for the TB6-R5 6-DOF robotic arm.
 
@@ -300,6 +347,7 @@ class TB6R5Interface:
         self._state_stop = threading.Event()
         self._topic_healthy = False
         try:
+            validate_robot_sdk(require_topic=self.enable_topic)
             if self.enable_topic:
                 self._connect_topic_subscriber()
 
@@ -343,6 +391,7 @@ class TB6R5Interface:
         """Start topic feedback only (no RPC). Used by LeRobot PICO teleop."""
         if not self.enable_topic:
             raise RuntimeError("connect_topic_feedback requires enable_topic=True")
+        validate_robot_sdk(require_topic=True)
         self._state_stop = threading.Event()
         self._topic_healthy = False
         try:
@@ -914,16 +963,20 @@ class TB6R5Interface:
     def gripper_distance_from_trigger(
         trigger_value: float,
         max_distance: float = DEFAULT_GRIPPER_MAX_D,
+        min_distance: float = DEFAULT_GRIPPER_MIN_D,
     ) -> float:
-        """Map VR trigger [0,1] to gripper distance in mm (0=closed, max=open)."""
+        """Map VR trigger [0,1] linearly to gripper distance in mm (trigger=0 open/max_d, trigger=1 closed/min_d)."""
         trigger = max(0.0, min(1.0, float(trigger_value)))
-        return (1.0 - trigger) * float(max_distance)
+        lo = float(min_distance)
+        hi = float(max_distance)
+        return hi - trigger * (hi - lo)
 
     @staticmethod
     def gripper_distance_from_joystick_axes(
         axis_x: float,
         axis_y: float,
         max_distance: float = DEFAULT_GRIPPER_MAX_D,
+        min_distance: float = DEFAULT_GRIPPER_MIN_D,
     ) -> float:
         """Legacy joystick mapping (deprecated; use gripper_distance_from_trigger)."""
         deflection = min(
@@ -931,7 +984,9 @@ class TB6R5Interface:
             max(abs(float(axis_x)), abs(float(axis_y))) / JOYSTICK_AXIS_DEFLECTION_MAX,
         )
         deflection = max(0.0, deflection)
-        return (1.0 - deflection) * float(max_distance)
+        lo = float(min_distance)
+        hi = float(max_distance)
+        return hi - deflection * (hi - lo)
 
     @staticmethod
     def _strip_cmd_braces(cmd: str) -> str:
@@ -940,18 +995,30 @@ class TB6R5Interface:
             return cmd[1:-1]
         return cmd
 
-    def _clamp_gripper_distance(self, distance: float, max_distance: Optional[float] = None) -> float:
+    def _clamp_gripper_distance(
+        self,
+        distance: float,
+        max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
+    ) -> float:
         if max_distance is None:
             max_distance = DEFAULT_GRIPPER_MAX_D
-        return max(0.0, min(float(distance), float(max_distance)))
+        if min_distance is None:
+            min_distance = DEFAULT_GRIPPER_MIN_D
+        lo = float(min_distance)
+        hi = float(max_distance)
+        if lo > hi:
+            lo, hi = hi, lo
+        return max(lo, min(float(distance), hi))
 
     def _format_gripper_inner(
         self,
         distance: float,
         interval: float,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
     ) -> str:
-        distance = self._clamp_gripper_distance(distance, max_distance)
+        distance = self._clamp_gripper_distance(distance, max_distance, min_distance)
         interval = max(0.0, float(interval))
         return f"MoveTwoFingersGripper --distance={distance:.4f} --interval={interval:.4f}"
 
@@ -997,10 +1064,11 @@ class TB6R5Interface:
         gripper_distance: float,
         interval: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
     ) -> str:
         if interval is None:
             interval = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL
-        grip_inner = self._format_gripper_inner(gripper_distance, interval, max_distance)
+        grip_inner = self._format_gripper_inner(gripper_distance, interval, max_distance, min_distance)
         return self.format_subloop1_exec_cmd(arm_inner, grip_inner)
 
     def send_subloop1_blocking(
@@ -1166,6 +1234,7 @@ class TB6R5Interface:
         gripper_distance: Optional[float],
         interval: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
         timeout_ms: int = DEFAULT_SUBLOOP1_EXEC_TIMEOUT_MS,
         immediate: Optional[bool] = None,
     ) -> bool:
@@ -1181,7 +1250,7 @@ class TB6R5Interface:
         if gripper_distance is None:
             grip_inner = NOT_RUN_EXECUTE
         else:
-            grip_inner = self._format_gripper_inner(gripper_distance, interval, max_distance)
+            grip_inner = self._format_gripper_inner(gripper_distance, interval, max_distance, min_distance)
         cmd = self.format_subloop1_exec_cmd(arm_inner, grip_inner, immediate=immediate)
         if self._subloop1_exiting:
             return False
@@ -1190,7 +1259,9 @@ class TB6R5Interface:
         else:
             ok = self._send_subloop1_stream_async(cmd)
         if ok and gripper_distance is not None:
-            self._last_gripper_distance_sent = self._clamp_gripper_distance(gripper_distance, max_distance)
+            self._last_gripper_distance_sent = self._clamp_gripper_distance(
+                gripper_distance, max_distance, min_distance
+            )
             self._last_gripper_cmd_time = time.time()
         return ok
 
@@ -1200,12 +1271,13 @@ class TB6R5Interface:
         force: bool = False,
         cmd_delta: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
     ) -> bool:
         if force:
             return True
         if cmd_delta is None:
             cmd_delta = self._gripper_cmd_delta_mm
-        gripper_distance = self._clamp_gripper_distance(gripper_distance, max_distance)
+        gripper_distance = self._clamp_gripper_distance(gripper_distance, max_distance, min_distance)
         if self._last_gripper_distance_sent is None:
             return True
         return abs(gripper_distance - self._last_gripper_distance_sent) >= cmd_delta
@@ -1215,16 +1287,24 @@ class TB6R5Interface:
         gripper_distance: float,
         interval: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
         force: bool = False,
         cmd_delta: Optional[float] = None,
     ) -> bool:
-        if not self._should_send_gripper(gripper_distance, force=force, cmd_delta=cmd_delta, max_distance=max_distance):
+        if not self._should_send_gripper(
+            gripper_distance,
+            force=force,
+            cmd_delta=cmd_delta,
+            max_distance=max_distance,
+            min_distance=min_distance,
+        ):
             return False
         return self.send_subloop1(
             NOT_RUN_EXECUTE,
             gripper_distance,
             interval=interval,
             max_distance=max_distance,
+            min_distance=min_distance,
         )
 
     def set_joint_positions_with_gripper(
@@ -1235,6 +1315,7 @@ class TB6R5Interface:
         clear_buffer: Optional[int] = None,
         interval: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
         cmd_delta: Optional[float] = None,
     ) -> bool:
         """Send JogAnyJ + MoveTwoFingersGripper atomically via SubLoop1 (stream async RPC)."""
@@ -1244,19 +1325,26 @@ class TB6R5Interface:
         q = np.asarray(q, dtype=float).ravel()
         n = min(len(q), self.joint_count)
         q_cmd = q[:n].copy()
-        gripper_distance = self._clamp_gripper_distance(gripper_distance, max_distance)
+        gripper_distance = self._clamp_gripper_distance(gripper_distance, max_distance, min_distance)
 
         gripper_changed = self._should_send_gripper(
             gripper_distance,
             force=force,
             cmd_delta=cmd_delta,
             max_distance=max_distance,
+            min_distance=min_distance,
         )
 
         clear_buffer = self._resolve_stream_clear_buffer(self._joint_stream_count, clear_buffer)
         arm_inner = self._strip_cmd_braces(self._format_jog_any_j_cmd(q_cmd, clear_buffer=clear_buffer))
         grip_arg = gripper_distance if gripper_changed else None
-        ok = self.send_subloop1(arm_inner, grip_arg, interval=interval, max_distance=max_distance)
+        ok = self.send_subloop1(
+            arm_inner,
+            grip_arg,
+            interval=interval,
+            max_distance=max_distance,
+            min_distance=min_distance,
+        )
         if not ok:
             return False
 
@@ -1272,6 +1360,7 @@ class TB6R5Interface:
         clear_buffer: Optional[int] = None,
         interval: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
         cmd_delta: Optional[float] = None,
         force: bool = False,
     ) -> bool:
@@ -1282,19 +1371,26 @@ class TB6R5Interface:
 
         xyz = np.asarray(xyz, dtype=float).ravel()[:3].copy()
         quat = np.asarray(quat_wxyz, dtype=float).ravel()[:4].copy()
-        gripper_distance = self._clamp_gripper_distance(gripper_distance, max_distance)
+        gripper_distance = self._clamp_gripper_distance(gripper_distance, max_distance, min_distance)
 
         gripper_changed = self._should_send_gripper(
             gripper_distance,
             force=force,
             cmd_delta=cmd_delta,
             max_distance=max_distance,
+            min_distance=min_distance,
         )
 
         clear_buffer = self._resolve_stream_clear_buffer(self._cartesian_stream_count, clear_buffer)
         arm_inner = self._strip_cmd_braces(self._format_jog_any_c_cmd(xyz, quat, clear_buffer))
         grip_arg = gripper_distance if gripper_changed else None
-        ok = self.send_subloop1(arm_inner, grip_arg, interval=interval, max_distance=max_distance)
+        ok = self.send_subloop1(
+            arm_inner,
+            grip_arg,
+            interval=interval,
+            max_distance=max_distance,
+            min_distance=min_distance,
+        )
         if not ok:
             return True
 
@@ -1308,9 +1404,15 @@ class TB6R5Interface:
         distance: float,
         interval: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
     ) -> bool:
-        """Send MoveTwoFingersGripper only (distance 0=closed, max=open, mm)."""
-        return self.send_gripper_only(distance, interval=interval, max_distance=max_distance)
+        """Send MoveTwoFingersGripper only (distance clamped to [min_d, max_d], mm)."""
+        return self.send_gripper_only(
+            distance,
+            interval=interval,
+            max_distance=max_distance,
+            min_distance=min_distance,
+        )
 
     def stop(self):
         if not self._subloop1_active:
@@ -1325,6 +1427,7 @@ class TB6R5Interface:
         gripper_distance: Optional[float] = None,
         interval: Optional[float] = None,
         max_distance: Optional[float] = None,
+        min_distance: Optional[float] = None,
         move_timeout_ms: int = DEFAULT_DUAL_MODEL_MOVE_TIMEOUT_MS,
         settle_timeout_s: float = 15.0,
     ) -> bool:
@@ -1340,7 +1443,7 @@ class TB6R5Interface:
         if gripper_distance is None:
             grip_inner = NOT_RUN_EXECUTE
         else:
-            grip_inner = self._format_gripper_inner(gripper_distance, interval, max_distance)
+            grip_inner = self._format_gripper_inner(gripper_distance, interval, max_distance, min_distance)
         ok = self.send_subloop1_blocking(
             arm_inner,
             grip_inner,
@@ -1349,7 +1452,9 @@ class TB6R5Interface:
             settle_timeout_s=settle_timeout_s,
         )
         if ok and gripper_distance is not None:
-            self._last_gripper_distance_sent = self._clamp_gripper_distance(gripper_distance, max_distance)
+            self._last_gripper_distance_sent = self._clamp_gripper_distance(
+                gripper_distance, max_distance, min_distance
+            )
             self._last_gripper_cmd_time = time.time()
         return ok
 

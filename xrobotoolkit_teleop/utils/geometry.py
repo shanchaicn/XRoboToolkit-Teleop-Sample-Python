@@ -3,12 +3,12 @@ import meshcat.transformations as tf
 
 R_HEADSET_TO_WORLD = np.array(
     [
+        [1, 0, 0],
         [0, 0, -1],
-        [-1, 0, 0],
         [0, 1, 0],
     ]
 )
-
+## 遥操作正方向：机械臂Y前 X右 Z上
 
 def is_valid_quaternion(quat, tol=1e-6):
     if not isinstance(quat, (list, tuple, np.ndarray)) or len(quat) != 4:

@@ -196,6 +196,10 @@ class TB6LeRobotV3Logger:
 
     def begin_episode(self) -> None:
         """Clear buffer before a new B-press recording segment."""
+        if self.dataset.episode_buffer is None:
+            # Resumed datasets start with no in-progress buffer; create one for the new episode.
+            self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+            return
         self.dataset.clear_episode_buffer(delete_images=True)
 
     def add_tb6_entry(self, entry: dict) -> None:
@@ -240,6 +244,9 @@ class TB6LeRobotV3Logger:
         return int(size)
 
     def discard_episode(self) -> None:
+        if self.dataset.episode_buffer is None:
+            print("[LeRobot] No in-progress episode buffer; skip discard")
+            return
         self.dataset.clear_episode_buffer(delete_images=True)
         print("[LeRobot] Discarded in-progress episode buffer")
 

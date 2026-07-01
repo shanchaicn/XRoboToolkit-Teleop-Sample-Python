@@ -112,15 +112,25 @@ def import_policy_factory():
         raise
 
 
+def _cuda_usable() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        torch.zeros(1, device="cuda")
+        return True
+    except RuntimeError:
+        return False
+
+
 def resolve_inference_device(device: str) -> str:
     """Map ``auto`` to cuda/cpu; fall back to CPU when CUDA is unavailable."""
     requested = (device or "auto").strip().lower()
     if requested == "auto":
-        if torch.cuda.is_available():
+        if _cuda_usable():
             return "cuda"
         print("[ACT] CUDA unavailable, using CPU (pass --device cuda to override when GPU is ready)")
         return "cpu"
-    if requested.startswith("cuda") and not torch.cuda.is_available():
+    if requested.startswith("cuda") and not _cuda_usable():
         print(f"[ACT] WARNING: --device {device} requested but CUDA unavailable, using CPU")
         return "cpu"
     return device

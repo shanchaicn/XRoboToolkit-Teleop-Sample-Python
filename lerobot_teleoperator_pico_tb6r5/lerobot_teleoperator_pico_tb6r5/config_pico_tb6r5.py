@@ -17,5 +17,6 @@ class PicoTB6R5Config(TeleoperatorConfig):
     control_rate_hz: int = 50
     require_joystick_arm: bool = False
     gripper_max_d: float = 70.0
+    gripper_min_d: float = 0.0
     safe_tcp_z_min_m: Optional[float] = 0.05
     safe_tcp_z_max_m: Optional[float] = 0.65

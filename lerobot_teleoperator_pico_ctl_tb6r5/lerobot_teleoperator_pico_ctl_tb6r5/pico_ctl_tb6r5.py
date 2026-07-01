@@ -50,6 +50,7 @@ class PicoCtlTB6R5(Teleoperator):
                 require_grip_to_send_commands=self.config.require_grip_to_send_commands,
                 require_joystick_arm=self.config.require_joystick_arm,
                 gripper_max_d=self.config.gripper_max_d,
+                gripper_min_d=self.config.gripper_min_d,
                 two_fingers_gripper_interval=self.config.two_fingers_gripper_interval,
                 two_fingers_gripper_cmd_delta=self.config.two_fingers_gripper_cmd_delta,
                 safe_tcp_z_min_m=self.config.safe_tcp_z_min_m,

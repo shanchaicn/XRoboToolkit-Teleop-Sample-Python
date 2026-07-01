@@ -25,6 +25,7 @@ class TB6R5Config(RobotConfig):
     subloop1_immediate: bool = False
 
     gripper_max_d: float = 70.0
+    gripper_min_d: float = 0.0
     gripper_interval: float = 25.0
     # Min change in gripper command input (mm) vs last sent target before issuing RPC.
     gripper_cmd_delta: float = 5.0

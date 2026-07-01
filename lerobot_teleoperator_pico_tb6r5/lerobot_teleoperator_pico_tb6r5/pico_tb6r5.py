@@ -45,6 +45,7 @@ class PicoTB6R5(Teleoperator):
                 control_rate_hz=self.config.control_rate_hz,
                 require_joystick_arm=self.config.require_joystick_arm,
                 gripper_max_d=self.config.gripper_max_d,
+                gripper_min_d=self.config.gripper_min_d,
                 safe_tcp_z_min_m=self.config.safe_tcp_z_min_m,
                 safe_tcp_z_max_m=self.config.safe_tcp_z_max_m,
                 topic_wait_timeout_s=self.config.topic_wait_timeout_s,

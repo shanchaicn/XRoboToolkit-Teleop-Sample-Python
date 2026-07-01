@@ -17,6 +17,7 @@ from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.robots.robot import Robot
 from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
     DEFAULT_GRIPPER_MAX_D,
+    DEFAULT_GRIPPER_MIN_D,
     DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
     TB6R5Interface,
 )
@@ -177,7 +178,8 @@ class TB6R5(Robot):
             target_q = present_q + delta
 
         gripper_max_d = self.config.gripper_max_d or DEFAULT_GRIPPER_MAX_D
-        target_gripper = float(np.clip(target_gripper, 0.0, gripper_max_d))
+        gripper_min_d = self.config.gripper_min_d if self.config.gripper_min_d is not None else DEFAULT_GRIPPER_MIN_D
+        target_gripper = float(np.clip(target_gripper, gripper_min_d, gripper_max_d))
         present_gripper = self.arm.get_gripper_distance_mm()
         if present_gripper is None:
             present_gripper = target_gripper
@@ -230,6 +232,7 @@ class TB6R5(Robot):
                 force=False,
                 interval=gripper_interval,
                 max_distance=gripper_max_d,
+                min_distance=gripper_min_d,
                 cmd_delta=grip_cmd_delta,
             )
             if sent_ok:
@@ -244,6 +247,7 @@ class TB6R5(Robot):
                 target_gripper,
                 interval=gripper_interval,
                 max_distance=gripper_max_d,
+                min_distance=gripper_min_d,
                 force=False,
                 cmd_delta=self.config.gripper_cmd_delta,
             )

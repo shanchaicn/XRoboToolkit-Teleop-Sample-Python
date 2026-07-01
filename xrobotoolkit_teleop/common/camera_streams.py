@@ -1,92 +1,25 @@
-"""Camera streaming for TB6-R5 ACT inference (RealSense, V4L2, or HTTP URL)."""
+"""Multi-backend camera capture (RealSense / V4L2 / HTTP) shared by teleop and ACT inference."""
 
 from __future__ import annotations
 
 import threading
 import time
-from typing import Protocol
+from typing import Literal
 
 import numpy as np
 
+from xrobotoolkit_teleop.hardware.interface.base_camera import BaseCameraInterface
+from xrobotoolkit_teleop.utils.image_utils import compress_image_to_jpg
 
-class CameraStreamProtocol(Protocol):
-    def start(self) -> None: ...
+DEFAULT_REALSENSE_SERIAL_DICT = {
+    "realsense_0": "135522071053",
+    "realsense_1": "327122073649",
+}
 
-    def wait_ready(self, timeout_s: float = 10.0) -> None: ...
-
-    def get_images(self) -> dict[str, np.ndarray]: ...
-
-    def stop(self) -> None: ...
-
-
-def to_rgb_hwc_uint8(color: np.ndarray, height: int, width: int) -> np.ndarray:
-    """Normalize to RGB HWC uint8; resize if needed."""
-    arr = np.asarray(color)
-    if arr.ndim == 3 and (arr.shape[0] != height or arr.shape[1] != width):
-        import cv2
-
-        arr = cv2.resize(arr, (width, height), interpolation=cv2.INTER_AREA)
-    if arr.dtype != np.uint8:
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-    return arr
+CameraBackend = Literal["realsense", "v4l2", "http"]
 
 
-_PREVIEW_WINDOWS: set[str] = set()
-
-
-def show_camera_rgb(images: dict[str, np.ndarray]) -> None:
-    """Show RGB frames in OpenCV windows (RGB -> BGR for imshow)."""
-    import cv2
-
-    for name, rgb in images.items():
-        if rgb is None:
-            continue
-        bgr = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
-        window = f"ACT RGB - {name}"
-        if window not in _PREVIEW_WINDOWS:
-            cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
-            _PREVIEW_WINDOWS.add(window)
-        cv2.imshow(window, bgr)
-    cv2.waitKey(1)
-
-
-def destroy_camera_windows() -> None:
-    import cv2
-
-    _PREVIEW_WINDOWS.clear()
-    cv2.destroyAllWindows()
-
-
-class CameraPreview:
-    """Refresh OpenCV preview on a dedicated thread (decoupled from inference loop)."""
-
-    def __init__(self, cam_stream: CameraStreamProtocol, fps: float = 30.0):
-        self._cam_stream = cam_stream
-        self._dt = 1.0 / max(fps, 1.0)
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def _loop(self) -> None:
-        while not self._stop.is_set():
-            start_t = time.time()
-            imgs = self._cam_stream.get_images()
-            if imgs:
-                show_camera_rgb(imgs)
-            elapsed = time.time() - start_t
-            if elapsed < self._dt:
-                time.sleep(self._dt - elapsed)
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-
-
-def _parse_name_value_pairs(spec: str, *, option: str, example: str) -> dict[str, str]:
+def parse_name_value_pairs(spec: str, *, option: str, example: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for pair in spec.split(","):
         pair = pair.strip()
@@ -101,16 +34,19 @@ def _parse_name_value_pairs(spec: str, *, option: str, example: str) -> dict[str
     return out
 
 
-def parse_camera_serials(spec: str | None, default_serial_dict: dict[str, str]) -> dict[str, str]:
+def parse_camera_serials(
+    spec: str | None,
+    default_serial_dict: dict[str, str] | None = None,
+) -> dict[str, str]:
     if not spec:
-        return dict(default_serial_dict)
-    return _parse_name_value_pairs(spec, option="--camera-serials", example="name=serial")
+        return dict(default_serial_dict or DEFAULT_REALSENSE_SERIAL_DICT)
+    return parse_name_value_pairs(spec, option="--camera-serials", example="name=serial")
 
 
 def parse_camera_devices(spec: str | None) -> dict[str, str]:
     if not spec:
         return {}
-    return _parse_name_value_pairs(
+    return parse_name_value_pairs(
         spec,
         option="--camera-devices",
         example="name=/dev/video0 or name=0",
@@ -120,48 +56,28 @@ def parse_camera_devices(spec: str | None) -> dict[str, str]:
 def parse_camera_urls(spec: str | None) -> dict[str, str]:
     if not spec:
         return {}
-    return _parse_name_value_pairs(
+    return parse_name_value_pairs(
         spec,
         option="--camera-urls",
         example="name=http://host:8888/RsCameraSensor/0/0/color",
     )
 
 
-def create_camera_stream(
-    *,
-    camera_urls: str | None,
-    camera_devices: str | None,
-    camera_serials: str | None,
-    default_serial_dict: dict[str, str],
-    width: int,
-    height: int,
-    fps: int,
-) -> tuple[CameraStreamProtocol | None, list[str]]:
-    """Open HTTP URL, V4L2, or RealSense streams. Returns (stream, sorted observation names)."""
-    url_dict = parse_camera_urls(camera_urls)
-    if url_dict:
-        if camera_serials or camera_devices:
-            print("[ACT][camera] --camera-urls set; ignoring --camera-serials and --camera-devices")
-        names = sorted(url_dict.keys())
-        stream = HttpCameraStream(url_dict, width, height, fps)
-        return stream, names
+def to_rgb_hwc_uint8(color: np.ndarray, height: int, width: int) -> np.ndarray:
+    arr = np.asarray(color)
+    if arr.ndim == 3 and (arr.shape[0] != height or arr.shape[1] != width):
+        import cv2
 
-    device_dict = parse_camera_devices(camera_devices)
-    if device_dict:
-        if camera_serials:
-            print("[ACT][camera] --camera-devices set; ignoring --camera-serials")
-        names = sorted(device_dict.keys())
-        stream = V4l2CameraStream(device_dict, width, height, fps)
-        return stream, names
-
-    serial_dict = parse_camera_serials(camera_serials, default_serial_dict)
-    names = sorted(serial_dict.keys())
-    stream = RealSenseCameraStream(serial_dict, width, height, fps)
-    return stream, names
+        arr = cv2.resize(arr, (width, height), interpolation=cv2.INTER_AREA)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
 
 
 class RealSenseCameraStream:
-    """Owns a RealSenseCameraInterface plus a background polling thread."""
+    """RealSense via RealSenseCameraInterface + background polling."""
+
+    backend: CameraBackend = "realsense"
 
     def __init__(self, serial_dict: dict[str, str], width: int, height: int, fps: int):
         from xrobotoolkit_teleop.hardware.interface.realsense import RealSenseCameraInterface
@@ -191,7 +107,7 @@ class RealSenseCameraStream:
             try:
                 self.cam.update_frames()
             except Exception as exc:
-                print(f"[ACT][camera] update_frames error: {exc}")
+                print(f"[camera] RealSense update_frames error: {exc}")
                 time.sleep(0.02)
 
     def wait_ready(self, timeout_s: float = 10.0) -> None:
@@ -200,10 +116,10 @@ class RealSenseCameraStream:
         while time.time() < deadline:
             frames = self.cam.get_frames()
             if needed.issubset(set(frames.keys())):
-                print("[ACT][camera] all RealSense cameras streaming")
+                print("[camera] all RealSense cameras streaming")
                 return
             time.sleep(0.1)
-        print("[ACT][camera] WARNING: not all RealSense cameras produced frames before timeout")
+        print("[camera] WARNING: not all RealSense cameras produced frames before timeout")
 
     def get_images(self) -> dict[str, np.ndarray]:
         frames = self.cam.get_frames()
@@ -227,6 +143,8 @@ class RealSenseCameraStream:
 class V4l2CameraStream:
     """Capture RGB via OpenCV VideoCapture (/dev/video* or numeric index)."""
 
+    backend: CameraBackend = "v4l2"
+
     def __init__(self, device_dict: dict[str, str], width: int, height: int, fps: int):
         self.device_dict = device_dict
         self.width = width
@@ -243,10 +161,8 @@ class V4l2CameraStream:
         import cv2
 
         if device.isdigit():
-            cap = cv2.VideoCapture(int(device), cv2.CAP_V4L2)
-        else:
-            cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        return cap
+            return cv2.VideoCapture(int(device), cv2.CAP_V4L2)
+        return cv2.VideoCapture(device, cv2.CAP_V4L2)
 
     def start(self) -> None:
         import cv2
@@ -259,7 +175,7 @@ class V4l2CameraStream:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             cap.set(cv2.CAP_PROP_FPS, self.fps)
             self._caps[name] = cap
-            print(f"[ACT][camera] opened V4L2 '{name}' -> {device}")
+            print(f"[camera] opened V4L2 '{name}' -> {device}")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -286,10 +202,10 @@ class V4l2CameraStream:
             with self._lock:
                 ready = needed.issubset(set(self._frames.keys()))
             if ready:
-                print("[ACT][camera] all V4L2 cameras streaming")
+                print("[camera] all V4L2 cameras streaming")
                 return
             time.sleep(0.1)
-        print("[ACT][camera] WARNING: not all V4L2 cameras produced frames before timeout")
+        print("[camera] WARNING: not all V4L2 cameras produced frames before timeout")
 
     def get_images(self) -> dict[str, np.ndarray]:
         with self._lock:
@@ -303,12 +219,14 @@ class V4l2CameraStream:
             try:
                 cap.release()
             except Exception as exc:
-                print(f"[ACT][camera] release '{name}' error: {exc}")
+                print(f"[camera] release '{name}' error: {exc}")
         self._caps.clear()
 
 
 class HttpCameraStream:
-    """Poll JPEG (or raw image bytes) from HTTP GET endpoints per camera."""
+    """Poll JPEG/PNG image bytes from HTTP GET endpoints."""
+
+    backend: CameraBackend = "http"
 
     def __init__(
         self,
@@ -331,7 +249,6 @@ class HttpCameraStream:
 
     @staticmethod
     def _extract_jpeg_bytes(data: bytes) -> bytes | None:
-        """Support raw JPEG or multipart/x-mixed-replace (e.g. RsCameraSensor --frame)."""
         if not data:
             return None
         start = data.find(b"\xff\xd8")
@@ -355,13 +272,12 @@ class HttpCameraStream:
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def _camera_loop(self, name: str, url: str) -> None:
-        """Keep one HTTP connection open and consume MJPEG frames as they arrive."""
         import urllib.error
         import urllib.request
 
         while not self._stop.is_set():
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "tb6r5-policy-infer/1.0"})
+                req = urllib.request.Request(url, headers={"User-Agent": "xrobotoolkit-camera/1.0"})
                 with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                     buf = b""
                     while not self._stop.is_set():
@@ -383,12 +299,12 @@ class HttpCameraStream:
                             buf = buf[-200_000:]
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if not self._stop.is_set():
-                    print(f"[ACT][camera] HTTP stream '{name}' disconnected: {exc}")
+                    print(f"[camera] HTTP stream '{name}' disconnected: {exc}")
                 time.sleep(0.3)
 
     def start(self) -> None:
         for name, url in self.url_dict.items():
-            print(f"[ACT][camera] opened HTTP '{name}' -> {url}")
+            print(f"[camera] opened HTTP '{name}' -> {url}")
             thread = threading.Thread(target=self._camera_loop, args=(name, url), daemon=True)
             thread.start()
             self._threads.append(thread)
@@ -400,10 +316,10 @@ class HttpCameraStream:
             with self._lock:
                 ready = needed.issubset(set(self._frames.keys()))
             if ready:
-                print("[ACT][camera] all HTTP cameras streaming")
+                print("[camera] all HTTP cameras streaming")
                 return
             time.sleep(0.1)
-        print("[ACT][camera] WARNING: not all HTTP cameras produced frames before timeout")
+        print("[camera] WARNING: not all HTTP cameras produced frames before timeout")
 
     def get_images(self) -> dict[str, np.ndarray]:
         with self._lock:
@@ -416,5 +332,100 @@ class HttpCameraStream:
         self._threads.clear()
 
 
-# Backward-compatible alias used before V4L2 support.
-CameraStream = RealSenseCameraStream
+def create_camera_stream(
+    *,
+    camera_urls: str | None = None,
+    camera_devices: str | None = None,
+    camera_serials: str | None = None,
+    camera_serial_dict: dict[str, str] | None = None,
+    width: int = 640,
+    height: int = 480,
+    fps: int = 30,
+    log_prefix: str = "[camera]",
+) -> tuple[RealSenseCameraStream | V4l2CameraStream | HttpCameraStream, list[str], CameraBackend]:
+    url_dict = parse_camera_urls(camera_urls)
+    if url_dict:
+        if camera_serials or camera_devices or camera_serial_dict:
+            print(f"{log_prefix} --camera-urls set; ignoring serials/devices")
+        names = sorted(url_dict.keys())
+        return HttpCameraStream(url_dict, width, height, fps), names, "http"
+
+    device_dict = parse_camera_devices(camera_devices)
+    if device_dict:
+        if camera_serials or camera_serial_dict:
+            print(f"{log_prefix} --camera-devices set; ignoring serials")
+        names = sorted(device_dict.keys())
+        return V4l2CameraStream(device_dict, width, height, fps), names, "v4l2"
+
+    if camera_serial_dict is not None:
+        serial_dict = dict(camera_serial_dict)
+    else:
+        serial_dict = parse_camera_serials(camera_serials)
+    names = sorted(serial_dict.keys())
+    return RealSenseCameraStream(serial_dict, width, height, fps), names, "realsense"
+
+
+class FlexibleCameraInterface(BaseCameraInterface):
+    """BaseCameraInterface adapter for RealSense / V4L2 / HTTP streams (no depth on V4L2/HTTP)."""
+
+    def __init__(
+        self,
+        *,
+        camera_serial_dict: dict[str, str] | None = None,
+        camera_devices: str | None = None,
+        camera_urls: str | None = None,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+        enable_compression: bool = True,
+        jpg_quality: int = 85,
+        log_prefix: str = "[TB6R5]",
+    ):
+        super().__init__(enable_compression=enable_compression, jpg_quality=jpg_quality)
+        self._stream, self._camera_names, self._backend = create_camera_stream(
+            camera_urls=camera_urls,
+            camera_devices=camera_devices,
+            camera_serial_dict=camera_serial_dict,
+            width=width,
+            height=height,
+            fps=fps,
+            log_prefix=log_prefix,
+        )
+
+    @property
+    def camera_names(self) -> list[str]:
+        return list(self._camera_names)
+
+    @property
+    def backend(self) -> CameraBackend:
+        return self._backend
+
+    def start(self) -> None:
+        self._stream.start()
+        self._stream.wait_ready()
+
+    def stop(self) -> None:
+        self._stream.stop()
+
+    def update_frames(self) -> None:
+        # RealSense stream polls in its own thread; V4L2/HTTP likewise.
+        pass
+
+    def get_frames(self) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for name, rgb in self._stream.get_images().items():
+            out[name] = {"color": rgb}
+        return out
+
+    def get_frame(self, identifier: str) -> dict | None:
+        return self.get_frames().get(identifier)
+
+    def get_compressed_frames(self) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for name, fd in self.get_frames().items():
+            color = fd.get("color")
+            entry: dict = {}
+            if color is not None:
+                entry["color"] = compress_image_to_jpg(color, self.jpg_quality)
+            out[name] = entry
+        return out
