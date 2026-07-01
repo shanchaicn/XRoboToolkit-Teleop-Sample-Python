@@ -119,7 +119,14 @@ def run_inference(args) -> int:
         from xrobotoolkit_teleop.hardware.interface.tb6r5 import TB6R5Interface
 
         arm = TB6R5Interface(
-            ip=args.robot_ip, rpc_port=args.rpc_port, joint_count=6, rpc_cmd_rate_hz=max(args.fps, 20)
+            ip=args.robot_ip,
+            rpc_port=args.rpc_port,
+            joint_count=6,
+            rpc_cmd_rate_hz=max(args.fps, 20),
+            zone_ratio=args.zone_ratio,
+            joint_vel=args.joint_vel,
+            joint_acc=args.joint_acc,
+            joint_dec=args.joint_dec,
         )
         arm.connect()
         print(f"[ACT] Connected to TB6-R5 at {args.robot_ip}:{args.rpc_port}")

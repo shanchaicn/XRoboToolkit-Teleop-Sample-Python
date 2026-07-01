@@ -12,8 +12,12 @@ from .constants import (
     DEFAULT_GRIPPER_RPC_RATE_HZ,
     DEFAULT_HOME_JOINT_DEG,
     DEFAULT_HOME_SETTLE_TIME_S,
+    DEFAULT_JOG_ANY_JOINT_ACC,
+    DEFAULT_JOG_ANY_JOINT_DEC,
+    DEFAULT_JOG_ANY_JOINT_VEL,
     DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA,
     DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
+    DEFAULT_ZONE_RATIO,
 )
 
 _DOC = """
@@ -60,6 +64,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--fps", type=float, default=DEFAULT_CONTROL_FPS, help="Control loop frequency (record script: 30)")
     parser.add_argument("--joint-step-max-rad", type=float, default=0.03, help="Per-step joint delta clamp (rad)")
+    parser.add_argument(
+        "--joint-vel",
+        type=float,
+        default=DEFAULT_JOG_ANY_JOINT_VEL,
+        help="JogAnyJ joint_vel in RPC (default: 6.0, same as teleop_tb6r5_hardware.py)",
+    )
+    parser.add_argument(
+        "--joint-acc",
+        type=float,
+        default=DEFAULT_JOG_ANY_JOINT_ACC,
+        help="JogAnyJ joint_acc in RPC (default: 3.0)",
+    )
+    parser.add_argument(
+        "--joint-dec",
+        type=float,
+        default=DEFAULT_JOG_ANY_JOINT_DEC,
+        help="JogAnyJ joint_dec in RPC (default: 3.0)",
+    )
+    parser.add_argument(
+        "--zone-ratio",
+        type=float,
+        default=DEFAULT_ZONE_RATIO,
+        help="JogAnyJ zone_ratio in RPC (default: 0.05)",
+    )
     parser.add_argument(
         "--arm-rpc-rate-hz",
         type=float,
