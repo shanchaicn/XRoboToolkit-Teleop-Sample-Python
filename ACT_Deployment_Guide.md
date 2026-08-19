@@ -78,7 +78,7 @@ V4L2 模式下用 `v4l2-ctl --list-devices` 确认 **RGB 采集节点**（RealSe
 查 RealSense SN：`rs-enumerate-devices | grep "Serial Number"`。
 
 实现见 `scripts/hardware/policy_infer_tb6r5_act.py` 与共享模块
-`xrobotoolkit_teleop/common/camera_streams.py`（方案 A 采集脚本同样支持 `--camera-devices` / `--camera-urls`）。
+`xrobotoolkit_teleop/common/camera_streams.py`（采集脚本同样支持 `--camera-devices` / `--camera-urls`）。
 
 ---
 
@@ -94,7 +94,7 @@ V4L2 模式下用 `v4l2-ctl --list-devices` 确认 **RGB 采集节点**（RealSe
 
 ---
 
-### 2.1 方案 A：一体化脚本 `teleop_tb6r5_hardware.py`
+### 2.1 一体化脚本 `teleop_tb6r5_hardware.py`
 
 输出目录默认 `data/lerobot/tb6r5_live`。
 
@@ -922,7 +922,7 @@ python scripts/hardware/test_direct_single_rpc.py --dry-run --mode gripper
 
 ## 10. 相关文件
 
-- 遥操作采集（方案 A）：`scripts/hardware/teleop_tb6r5_hardware.py`（见第 2.1 节）
+- 遥操作采集：`scripts/hardware/teleop_tb6r5_hardware.py`（见第 2.1 节）
 - 真机推理：`scripts/hardware/policy_infer_tb6r5_act.py`
 - 离线评估：`scripts/misc/eval_act_on_lerobot_tb6r5.py`
 - SubLoop1 接口测试：`scripts/hardware/test_subloop1_joganyj_gripper.py`（见第 7.1 节）
