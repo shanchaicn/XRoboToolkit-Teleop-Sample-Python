@@ -11,9 +11,49 @@ cd ~/study/XRoboToolkit-Teleop-Sample-Python
 conda activate pico
 ```
 
+## 安装 TB6-R5 Topic / RPC 依赖（首次运行必做）
+
+遥操作和真机推理需要机器人 Topic、RPC SDK。仓库不直接保存 `dependencies/`，
+请运行固定版本安装脚本：
+
+```bash
+./scripts/hardware/setup_tb6r5_dependencies.sh
+```
+
+脚本默认安装到项目根目录的 `dependencies/`，并固定使用本项目原先验证过的 Gitee 提交：
+
+| 用途 | Gitee 仓库 | 固定提交 |
+|------|-------------|----------|
+| Topic 状态反馈 | `zhenshi-controller-api-data/get_status_py` | `ab1a30059a45a6c80bad5645278701b80e3a6e4f`（短号 `ab1a300`） |
+| RPC 指令下发 | `zhenshi-controller-api-data/hello_demo_py` | `27cd9e2fd67356c55fd482dd2821ee58c4c9bdd4`（短号 `27cd9e2`） |
+
+安装后的关键目录：
+
+```text
+dependencies/get_status_py/topic_all_py/
+dependencies/hello_demo_py/rpc_py_all/
+```
+
+如果目录已存在但版本不同，脚本会停止并提示。确认可以删除旧目录后再强制重装：
+
+```bash
+FORCE=1 ./scripts/hardware/setup_tb6r5_dependencies.sh
+```
+
+安装到其他位置时，将目标目录作为参数传入：
+
+```bash
+./scripts/hardware/setup_tb6r5_dependencies.sh /path/to/dependencies
+```
+
+安装后可检查 SDK 文件：
+
+```bash
+python scripts/hardware/verify_tb6r5_sdk.py
+```
+
 > 注意：终端的当前目录必须是项目根目录，否则相对路径 `scripts/...` 会报
 > `can't open file ... No such file or directory`。
-
 ---
 
 ## 0. 资源路径（已下载并验证）
@@ -922,7 +962,10 @@ python scripts/hardware/test_direct_single_rpc.py --dry-run --mode gripper
 
 ## 10. 相关文件
 
+- Topic / RPC 依赖安装（Gitee 固定 commit）：`scripts/hardware/setup_tb6r5_dependencies.sh`
+  - Topic `get_status_py@ab1a300`，RPC `hello_demo_py@27cd9e2` → 默认装到 `dependencies/`
 - 遥操作采集：`scripts/hardware/teleop_tb6r5_hardware.py`（见第 2.1 节）
+- SDK 自检：`scripts/hardware/verify_tb6r5_sdk.py`
 - 真机推理：`scripts/hardware/policy_infer_tb6r5_act.py`
 - 离线评估：`scripts/misc/eval_act_on_lerobot_tb6r5.py`
 - SubLoop1 接口测试：`scripts/hardware/test_subloop1_joganyj_gripper.py`（见第 7.1 节）
