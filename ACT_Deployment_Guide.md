@@ -110,21 +110,41 @@ pip install -e ./lerobot_teleoperator_pico_ctl_tb6r5 --no-deps # B2
 
 输出目录默认 `data/lerobot/tb6r5_live`。
 
-#### 推荐命令
-rs现在有的序列号
-244222075136
-135522071053
-347622071274
+**默认行为（不写参数时）：** `--control-rate-hz 20`、`--log-freq 20`、`--g-model 3`、`--subloop 0`、`--cd-version 45`；**默认不录制**；深度关闭。只有加 `--enable-lerobot-log` 才会开启 log / 写 LeRobot。
+
+当前可用 RealSense 序列号：`244222075136` / `135522071053` / `347622071274`。
+
+#### 仅遥操作（不录制）
+
+```bash
+python scripts/hardware/teleop_tb6r5_hardware.py \
+  --robot-ip 192.168.11.11
+```
+
+可选：`--no-enable-camera` 关掉预览相机。
+
+#### 开启 LeRobot 录制（推荐）
+
+```bash
+python scripts/hardware/teleop_tb6r5_hardware.py \
+  --robot-ip 192.168.11.11 \
+  --enable-lerobot-log \
+  --lerobot-root data/lerobot/tb6r5_test \
+  --lerobot-repo-id local/tb6r5_test \
+  --lerobot-task "tb6r5 teleoperation test" \
+  --lerobot-overwrite
+```
+
+完整示例（显式写出相机序列号与常用调参）：
+
 ```bash
 python scripts/hardware/teleop_tb6r5_hardware.py \
   --robot-ip 192.168.11.11 \
   --teleop-mode placo_ik \
-  --control-rate-hz 50 \
   --scale-factor 1.5 \
   --zone-ratio 0.00 \
   --gripper-max-d 70 \
   --gripper-min-d 30 \
-  --enable-log-data \
   --enable-camera \
   --camera-serial-dict.realsense-0 135522071053 \
   --camera-serial-dict.realsense-1 244222075136 \
@@ -136,20 +156,17 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
   --lerobot-overwrite \
   --lerobot-image-writer-processes 0 \
   --lerobot-image-writer-threads 4 \
-  --lerobot-encoder-threads 2 \
-  --no-enable-camera-depth \
-  --g-model 3 --subloop 0 --cd-version 45
+  --lerobot-encoder-threads 2
 ```
 
-> `--lerobot-overwrite` 会删除已有 `data/lerobot/tb6r5_live` 后重建。续采请改
-> `--lerobot-resume`（去掉 overwrite）。
+> `--enable-lerobot-log` 会自动打开 `enable-log-data`。`--lerobot-overwrite` 会删除已有 root 后重建；续采用 `--lerobot-resume`（不要同时 overwrite）。
 
 #### 采集：V4L2 相机（无 pyrealsense2）
 
 ```bash
 python scripts/hardware/teleop_tb6r5_hardware.py \
   --robot-ip 192.168.11.11 \
-  --enable-log-data --enable-camera --no-enable-camera-depth \
+  --enable-camera \
   --camera-devices 'realsense_0=/dev/video0,realsense_1=/dev/video4' \
   --enable-lerobot-log \
   --lerobot-root data/lerobot/tb6r5_live \
@@ -162,7 +179,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
 ```bash
 python scripts/hardware/teleop_tb6r5_hardware.py \
   --robot-ip 192.168.11.11 \
-  --enable-log-data --enable-camera --no-enable-camera-depth \
+  --enable-camera \
   --camera-urls 'realsense_0=http://192.168.2.42:8888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.42:8888/RsCameraSensor/1/0/color' \
   --enable-lerobot-log \
   --lerobot-root data/lerobot/tb6r5_live \
@@ -170,22 +187,22 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
 ```
 
 > 设置 `--camera-urls` 或 `--camera-devices` 后忽略 `--camera-serial-dict.*`。
-> V4L2/HTTP 模式不支持 depth（请保持 `--no-enable-camera-depth`、勿加 `--lerobot-include-depth`）。
+> V4L2/HTTP 模式不支持 depth（默认已关 depth；勿加 `--lerobot-include-depth`）。
 
 ### 2.2 VR 手柄操作
 
 | 输入 | 作用 |
 |------|------|
-| **按住 `right_grip`** | 移动机械臂（松开自动 SubLoop1 exit） |
+| **按住 `right_grip`** | 移动机械臂（松开后停发指令；`--subloop 1` 时另发 SubLoop1 exit） |
 | **`right_trigger`** | 夹爪开合（0mm=闭合，`--gripper-max-d`=全开） |
-| **`B`** | 开始 / 结束采集并保存当前 episode |
+| **`B`** | 开始 / 结束采集并保存当前 episode（仅 `--enable-lerobot-log` 时有效） |
 | **`A`** | 丢弃当前 episode 并回 home |
 | **`X`** | 回 home |
 
 默认需**按住 `right_grip` 才会下发 RPC**（含夹爪）。若希望不握把也能控夹爪，加
 `--no-require-grip-to-send-commands`。
 
-底层下发：臂 **50Hz**、夹爪 **2Hz**（SubLoop1 流式 `JogAnyJ` + `MoveTwoFingersGripper`）。
+默认下发：`--g-model 3` 时臂与夹爪同频（随 `--control-rate-hz`，默认 20Hz）；`--subloop 0` 为直接 `{arm||grip}`。
 
 ### 2.3 采集参数说明（`teleop_tb6r5_hardware.py --help`）
 
@@ -209,7 +226,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 |------|--------|------|
 | `--teleop-mode` | `placo_ik` | `placo_ik`（PICO→Placo IK→JogAnyJ）或 `jog_any_c`（Topic robottarget→JogAnyC） |
 | `--scale-factor` | `1.5` | PICO 手柄位姿增量缩放，越大越“跟手” |
-| `--control-rate-hz` | `50` | IK / 控制主循环频率（Hz）；臂 RPC 默认同频 50Hz |
+| `--control-rate-hz` | `20` | IK / 控制主循环频率（Hz） |
 | `--require-grip-to-send-commands` | on | 仅按住 `right_grip` 时发 RPC；`--no-require-grip-to-send-commands` 关闭 |
 | `--require-joystick-arm` | off | on 时需先按 `--teleop-arm-button` 才允许遥控 |
 | `--teleop-arm-button` | `right_axis_click` | 遥控门控按键（配合 `require-joystick-arm`） |
@@ -261,19 +278,21 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 | `--gripper-min-d` | `0.0` | 最小距离 / 全闭合（mm），须与训练一致 |
 | `--two-fingers-gripper-interval` | `5.0` | `MoveTwoFingersGripper` interval |
 | `--gripper-observation-default` | `0.0` | 无反馈时的夹爪观测默认值 |
-| `--g-model` | `2` | `0`=无夹爪单模型 RPC（`{Enable}`/`{JogAnyJ}`，无 `\|\|`）；`2`=MoveTwoFingers；`3`=JogAnyJ j1 |
+| `--g-model` | `3` | `0`=无夹爪单模型 RPC；`2`=MoveTwoFingers；`3`=JogAnyJ j1（默认） |
+| `--subloop` | `0` | `0`=直接 `{arm\|\|grip}`；`1`=`SubLoop1 --exec` 嵌套 |
+| `--cd-version` | `45` | JogAnyJ 方言：`45` 省略 zone/clear_buffer；`44` 带二者 |
 
-夹爪 RPC 固定 **2Hz**；与上次指令差小于 `two_fingers_gripper_cmd_delta`（控制器内部默认 0.5mm）时不重复下发。
+`--g-model 3` 时夹爪 RPC 与臂同频；`--g-model 2` 时夹爪约 **2Hz**，与上次指令差小于内部 `cmd_delta`（默认 0.5mm）时不重复下发。
 
 #### 相机
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--enable-camera` | on | 启用相机（`enable-log-data` 时默认可开） |
+| `--enable-camera` | on | 启用相机预览（录制时建议保持开启） |
 | `--camera-width` | `640` | 图像宽 |
 | `--camera-height` | `480` | 图像高 |
 | `--camera-fps` | `30` | 相机帧率 |
-| `--enable-camera-depth` | on | 预览/日志是否读 depth（仅 RealSense；V4L2/HTTP 无 depth） |
+| `--enable-camera-depth` | off | 预览是否读 depth（仅 RealSense；默认关） |
 | `--enable-camera-compression` | on | 日志 JPG 压缩 |
 | `--camera-jpg-quality` | `85` | JPG 质量 |
 
@@ -298,16 +317,16 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--enable-log-data` | on | 启用数据记录线程 |
-| `--log-dir` | `logs/tb6r5` | pkl 分段日志目录（非 LeRobot 时） |
-| `--log-freq` | `50` | 采集帧率（Hz），建议与 `--control-rate-hz` 一致 |
+| `--enable-log-data` | off | 内部日志线程；**仅**在加 `--enable-lerobot-log` 时自动打开 |
+| `--log-dir` | `logs/tb6r5` | pkl 分段日志目录（一般无需手动开） |
+| `--log-freq` | `20` | 采集帧率（Hz），建议与 `--control-rate-hz` 一致 |
 | `--log-joint-count` | `6` | 日志关节维数 |
 
 **LeRobot v3 在线写入（与 `lerobot_record` 同 schema）**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--enable-lerobot-log` | off | 直接写 LeRobot v3（推荐采集时打开） |
+| `--enable-lerobot-log` | off | **打开后才录制**；自动启用 `enable-log-data` |
 | `--lerobot-root` | `data/lerobot/tb6r5_live` | 数据集根目录 |
 | `--lerobot-repo-id` | `local/tb6r5_live` | repo id，须与 `meta/info.json` 一致 |
 | `--lerobot-task` | `tb6r5 teleoperation` | 每帧 `task` 字段 |
@@ -324,7 +343,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 | 现象 | 可尝试 |
 |------|--------|
 | 臂动得慢、跟不上手 | `--scale-factor 2.0`、`--joint-vel 2~6`（默认 vel/acc/dec=`1/1/1`） |
-| 录制卡顿拖累体感 | `--no-enable-camera-depth`、`--lerobot-encoder-threads 2`、减相机路数 |
+| 录制卡顿拖累体感 | 保持 depth 关闭、`--lerobot-encoder-threads 2`、减相机路数 |
 | Z 方向被挡住 | 检查 `--safe-tcp-z-min-m` / `--safe-tcp-z-max-m` |
 | 必须握把才动 | 默认 `--require-grip-to-send-commands`；松开 `right_grip` 即停 |
 

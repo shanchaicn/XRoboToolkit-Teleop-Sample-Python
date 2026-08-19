@@ -44,17 +44,17 @@ JOYSTICK_AXIS_DEFLECTION_MAX = 1.0
 DEFAULT_JOG_ANY_C_ASYNC_TIMEOUT_MS = DEFAULT_JOG_ASYNC_TIMEOUT_MS
 
 # JogAnyJ RPC dialect (controller / Codeit version).
-# 44: include --zone_ratio and --clear_buffer (current).
-# 45: omit --zone_ratio and --clear_buffer.
-DEFAULT_CD_VERSION = 44
+# 44: include --zone_ratio and --clear_buffer.
+# 45: omit --zone_ratio and --clear_buffer (current default).
+DEFAULT_CD_VERSION = 45
 CD_VERSIONS = (44, 45)
 
-# subloop: 1=wrap JogAnyJ in SubLoop1 --exec={...} (default); 0=direct {arm||grip} dual-model.
-DEFAULT_SUBLOOP = 1
+# subloop: 1=wrap JogAnyJ in SubLoop1 --exec={...}; 0=direct {arm||grip} dual-model (default).
+DEFAULT_SUBLOOP = 0
 SUBLOOP_MODES = (0, 1)
 
-# g_model: 0=arm-only (no || dual-model), 2=MoveTwoFingersGripper, 3=JogAnyJ j1 meters
-DEFAULT_G_MODEL = 2
+# g_model: 0=arm-only (no || dual-model), 2=MoveTwoFingersGripper, 3=JogAnyJ j1 meters (default)
+DEFAULT_G_MODEL = 3
 G_MODELS = (0, 2, 3)
 # Collect / teleop g_model=3: 0–80mm ↔ j1 0.000–0.080 m; vel/acc/dec=0.5
 DEFAULT_GRIPPER_G3_MAX_D = 80.0

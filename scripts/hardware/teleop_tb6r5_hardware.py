@@ -12,19 +12,19 @@ Usage:
     # right_grip: move arm; right_trigger: gripper (--require-joystick-arm enables right_axis_click gate)
     # A: discard + home; B: toggle logging
     # --debug-grip: print right_grip on ON/OFF edges + ~5 Hz heartbeat (grip + trigger)
+    # Defaults: --control-rate-hz 20 --log-freq 20 --g-model 3 --subloop 0 --cd-version 45
+    # Logging off by default; --enable-lerobot-log turns on log (+ implies enable-log-data)
+    # Depth off by default (--enable-camera-depth / --lerobot-include-depth to enable)
     # --g-model 0: arm-only (no gripper, single-model RPC); 2: MoveTwoFingersGripper; 3: JogAnyJ j1 gripper
-    # --subloop 1 (default): SubLoop1 --exec nesting; --subloop 0: direct (g_model=0 → {JogAnyJ}; else {arm||grip})
-    python scripts/hardware/teleop_tb6r5_hardware.py --scale-factor 2.0 --cartesian-max-step-pos-m 0.05
-    python scripts/hardware/teleop_tb6r5_hardware.py --g-model 0 --no-enable-log-data --no-enable-camera
-    python scripts/hardware/teleop_tb6r5_hardware.py --g-model 3 --cd-version 45 --enable-log-data --enable-lerobot-log
-    python scripts/hardware/teleop_tb6r5_hardware.py --g-model 3 --subloop 0
+    # --subloop 0 (default): direct {arm||grip}; --subloop 1: SubLoop1 --exec nesting
+    python scripts/hardware/teleop_tb6r5_hardware.py --robot-ip 192.168.11.11
+    python scripts/hardware/teleop_tb6r5_hardware.py --robot-ip 192.168.11.11 --enable-lerobot-log
+    python scripts/hardware/teleop_tb6r5_hardware.py --g-model 0
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --cartesian-vel 1.0 --cartesian-acc 1.0 --cartesian-dec 1.0
     python scripts/hardware/teleop_tb6r5_hardware.py --jog-any-c-preview
     python scripts/visualization/vis_jog_any_c_robottarget.py
-    python scripts/hardware/teleop_tb6r5_hardware.py --enable-log-data --log-dir logs/tb6r5
-    python scripts/hardware/teleop_tb6r5_hardware.py --enable-log-data --enable-camera
-    # Save directly as LeRobot v3 (no .pkl); B=episode, A=discard, same as official lerobot_record
-    python scripts/hardware/teleop_tb6r5_hardware.py --enable-log-data --enable-camera \
+    # Save directly as LeRobot v3; B=episode, A=discard
+    python scripts/hardware/teleop_tb6r5_hardware.py --robot-ip 192.168.11.11 \
         --enable-lerobot-log --lerobot-root data/lerobot/tb6r5_live --lerobot-repo-id local/tb6r5_live \
         --lerobot-overwrite
 """
@@ -101,13 +101,13 @@ def main(
     print_ik_tcp_pose: bool = DEFAULT_PRINT_IK_TCP_POSE,
     print_ik_tcp_pose_interval_s: float = DEFAULT_PRINT_IK_TCP_POSE_INTERVAL_S,
     visualize_placo: bool = False,
-    control_rate_hz: int = 50,
+    control_rate_hz: int = 20,
     arm_rpc_rate_hz: float = DEFAULT_ARM_RPC_RATE_HZ,
     gripper_rpc_rate_hz: float = DEFAULT_GRIPPER_RPC_RATE_HZ,
     g_model: int = DEFAULT_G_MODEL,
     cd_version: int = DEFAULT_CD_VERSION,
     subloop: int = DEFAULT_SUBLOOP,
-    enable_log_data: bool = True,
+    enable_log_data: bool = False,
     enable_lerobot_log: bool = False,
     lerobot_root: str = "data/lerobot/tb6r5_live",
     lerobot_repo_id: str = "local/tb6r5_live",
@@ -120,7 +120,7 @@ def main(
     lerobot_encoder_threads: int = 2,
     lerobot_include_depth: bool = False,
     log_dir: str = "logs/tb6r5",
-    log_freq: float = 50,
+    log_freq: float = 20,
     enable_camera: bool = True,
     camera_serial_dict: dict[str, str] = DEFAULT_REALSENSE_SERIAL_DICT,
     camera_devices: str | None = None,
@@ -128,7 +128,7 @@ def main(
     camera_width: int = 640,
     camera_height: int = 480,
     camera_fps: int = 30,
-    enable_camera_depth: bool = True,
+    enable_camera_depth: bool = False,
     enable_camera_compression: bool = True,
     camera_jpg_quality: int = 85,
     log_joint_count: int = DEFAULT_LOG_JOINT_COUNT,
@@ -151,6 +151,11 @@ def main(
         visualize_placo = True
         enable_log_data = False
         enable_camera = False
+        enable_lerobot_log = False
+
+    # Recording only when --enable-lerobot-log (implies internal log thread).
+    if enable_lerobot_log:
+        enable_log_data = True
 
     if g_model not in G_MODELS:
         raise ValueError(f"--g-model must be one of {G_MODELS}, got {g_model}")
