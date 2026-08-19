@@ -1,4 +1,4 @@
-"""Gripper observation and command helpers for TB6-R5 ACT inference."""
+"""Gripper observation and command helpers for TB6-R5 policy inference."""
 
 from __future__ import annotations
 
@@ -148,6 +148,38 @@ def gripper_edge_min_steps(fps: float, min_interval_s: float) -> int:
     return max(1, int(round(fps * min_interval_s)))
 
 
+def resolve_gripper_cmd_delta(
+    *,
+    on_gripper_rpc_tick: bool,
+    threshold_enabled: bool,
+    cmd_delta: float,
+    allow_send: bool = True,
+) -> float:
+    """Resolve cmd_delta for a control step.
+
+    Default (threshold off): 0 on gripper RPC ticks → send every tick.
+    Threshold on: use ``cmd_delta`` mm gating (legacy behavior).
+    """
+    if not on_gripper_rpc_tick or not allow_send:
+        return float("inf")
+    if threshold_enabled:
+        return cmd_delta
+    return 0.0
+
+
+def should_send_gripper_mm(
+    gripper_distance: float,
+    last_sent_mm: float | None,
+    cmd_delta: float,
+) -> bool:
+    """Return whether gripper distance changed enough to warrant a SubLoop1 gripper cmd."""
+    if cmd_delta == float("inf"):
+        return False
+    if last_sent_mm is None:
+        return True
+    return abs(gripper_distance - last_sent_mm) >= cmd_delta
+
+
 def print_gripper_status(
     *,
     gripper_raw: float,
@@ -166,27 +198,30 @@ def print_gripper_status(
     gripper_subloop: str | None = None,
     pending_gripper_mm: float | None = None,
     edge_accepted: bool = False,
+    log_prefix: str = "POLICY",
+    dry_run: bool = False,
+    on_arm_rpc_tick: bool = False,
 ) -> None:
     state = gripper_state_label_mm(gripper_cmd_mm, gripper_min_distance, gripper_max_distance)
+    prefix = "dry-run: " if dry_run else ""
     if legacy_mode:
         if gripper_subloop == "NotRunExecute":
             pending_info = f" pending={pending_gripper_mm:.0f}mm" if pending_gripper_mm is not None else ""
-            cmd_status = (
-                f"legacy arm JogAnyJ, gripper=NotRunExecute"
-                f"{pending_info} (edge={edge_accepted})"
-            )
+            cmd_status = f"{prefix}legacy arm JogAnyJ, gripper=NotRunExecute" f"{pending_info} (edge={edge_accepted})"
         elif gripper_subloop:
-            cmd_status = f"legacy gripper {gripper_subloop} interval={gripper_interval:.1f}"
+            cmd_status = f"{prefix}legacy gripper {gripper_subloop} interval={gripper_interval:.1f}"
         else:
-            cmd_status = f"legacy hysteresis edge={edge_accepted}"
+            cmd_status = f"{prefix}legacy hysteresis edge={edge_accepted}"
+    elif not on_arm_rpc_tick:
+        cmd_status = f"{prefix}skip (not arm RPC tick)"
     elif gripper_subloop == "NotRunExecute":
-        cmd_status = "SubLoop1 arm JogAnyJ, gripper=NotRunExecute"
+        cmd_status = f"{prefix}SubLoop1 arm JogAnyJ, gripper=NotRunExecute"
     elif gripper_subloop:
-        cmd_status = f"SubLoop1 gripper {gripper_subloop} interval={gripper_interval:.1f}"
+        cmd_status = f"{prefix}SubLoop1 gripper {gripper_subloop} interval={gripper_interval:.1f}"
     elif sent:
-        cmd_status = "SubLoop1 sent"
+        cmd_status = f"{prefix}SubLoop1 sent"
     else:
-        cmd_status = "no arm RPC this step"
+        cmd_status = f"{prefix}SubLoop1 arm only"
     chunk_info = ""
     if chunk_step is not None and chunk_size is not None:
         chunk_info = f" chunk={chunk_step + 1}/{chunk_size}"
@@ -200,8 +235,9 @@ def print_gripper_status(
         action_str = f"action[6]={gripper_raw:.2f}mm"
         obs_str = f"obs={gripper_obs:.2f}mm"
     line = (
-        f"[ACT][GRIPPER] {action_str} latched_cmd={gripper_cmd_mm:.2f}mm "
-        f"{obs_str} state={state}{latched_info} sent={sent}{chunk_info} | {cmd_status}"
+        f"[{log_prefix}][GRIPPER] {action_str} latched_cmd={gripper_cmd_mm:.2f}mm "
+        f"{obs_str} state={state}{latched_info} "
+        f"{'would_send' if dry_run else 'sent'}={sent}{chunk_info} | {cmd_status}"
     )
     print(line)
 
@@ -222,52 +258,56 @@ def print_gripper_config(
     control_fps: float | None = None,
     gripper_close_mm: float | None = None,
     gripper_open_mm: float | None = None,
+    gripper_threshold: bool = False,
+    log_prefix: str = "POLICY",
 ) -> None:
     mode = (
         "continuous mm + SubLoop1"
         if gripper_continuous
         else "legacy hysteresis (arm SubLoop1 JogAnyJ + binary gripper)"
     )
+    threshold_label = f"threshold={'on' if gripper_threshold else 'off'}"
     print(
-        f"{RED}[ACT][GRIPPER] 配置: min_dist={gripper_min_distance:.1f}mm "
+        f"{RED}[{log_prefix}][GRIPPER] 配置: min_dist={gripper_min_distance:.1f}mm "
         f"max_dist={gripper_max_distance:.1f}mm "
-        f"interval={gripper_interval:.1f} cmd_delta={gripper_cmd_delta:.2f}mm mode={mode}{RESET}"
+        f"interval={gripper_interval:.1f} cmd_delta={gripper_cmd_delta:.2f}mm "
+        f"{threshold_label} mode={mode}{RESET}"
     )
     if arm_rpc_rate_hz is not None and gripper_rpc_rate_hz is not None and control_fps is not None:
         arm_stride, grip_stride = rpc_strides(control_fps, arm_rpc_rate_hz, gripper_rpc_rate_hz)
         print(
-            f"{RED}[ACT][GRIPPER] RPC 分频: control={control_fps:.0f}Hz "
+            f"{RED}[{log_prefix}][GRIPPER] RPC 分频: control={control_fps:.0f}Hz "
             f"arm={arm_rpc_rate_hz:.0f}Hz (stride={arm_stride}) "
             f"gripper={gripper_rpc_rate_hz:.0f}Hz (stride={grip_stride}){RESET}"
         )
     if gripper_normalized:
         print(
-            f"{RED}[ACT][GRIPPER] action[6]/state[6] 训练为 [0,1] 归一化；"
+            f"{RED}[{log_prefix}][GRIPPER] action[6]/state[6] 训练为 [0,1] 归一化；"
             f"推理 obs: mm/{gripper_max_distance:.0f}，action: norm×{gripper_max_distance:.0f}mm。{RESET}"
         )
     else:
         print(
-            f"{RED}[ACT][GRIPPER] action[6]/state[6] 单位为 mm"
+            f"{RED}[{log_prefix}][GRIPPER] action[6]/state[6] 单位为 mm"
             f"（{gripper_min_distance:.0f}=闭合，{gripper_max_distance:.0f}=张开）；"
             f"与 record_tb6r5_lerobot.sh 一致。{RESET}"
         )
     if not gripper_continuous and gripper_close_mm is not None and gripper_open_mm is not None:
         print(
-            f"{RED}[ACT][GRIPPER] 滞回阈值: mm<={gripper_close_mm:.1f}→{gripper_min_distance:.0f}mm(闭合), "
+            f"{RED}[{log_prefix}][GRIPPER] 滞回阈值: mm<={gripper_close_mm:.1f}→{gripper_min_distance:.0f}mm(闭合), "
             f"mm>={gripper_open_mm:.1f}→{gripper_max_distance:.0f}mm(张开){RESET}"
         )
     if temporal_ensemble_coeff is not None:
         print(
-            f"{RED}[ACT][ACTION] Temporal Ensemble coeff={temporal_ensemble_coeff:g}, "
+            f"{RED}[{log_prefix}][ACTION] Temporal Ensemble coeff={temporal_ensemble_coeff:g}, "
             f"chunk_size={chunk_size}：每步推理并融合重叠 chunk 预测。{RESET}"
         )
     elif refresh_policy_every_step:
         print(
-            f"{RED}[ACT][ACTION] 每步 policy.reset() + 重推理（action queue 不累积；"
+            f"{RED}[{log_prefix}][ACTION] 每步 policy.reset() + 重推理（action queue 不累积；"
             f"chunk_size={chunk_size}）。{RESET}"
         )
     elif n_action_steps is not None:
         print(
-            f"{RED}[ACT][ACTION] Action queue: chunk_size={chunk_size}, n_action_steps={n_action_steps}，"
+            f"{RED}[{log_prefix}][ACTION] Action queue: chunk_size={chunk_size}, n_action_steps={n_action_steps}，"
             f"每 {n_action_steps} 步重推理。可调 --n-action-steps 或 --temporal-ensemble-coeff 0.01。{RESET}"
         )

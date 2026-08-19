@@ -257,7 +257,9 @@ def run_eval(args) -> int:
         preprocessor_overrides={"device_processor": {"device": str(policy.config.device)}},
     )
 
-    image_keys = sorted([k for k in ds_meta.features.keys() if k.startswith("observation.images.") and ".depth" not in k])
+    image_keys = sorted(
+        [k for k in ds_meta.features.keys() if k.startswith("observation.images.") and ".depth" not in k]
+    )
     state_key = "observation.state"
     action_key = "action"
 

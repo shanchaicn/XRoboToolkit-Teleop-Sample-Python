@@ -1,4 +1,5 @@
 # TB6-R5 ACT 模型部署指南（评估 → Dry-Run → 真机）
+# 时间 0701
 
 > **观测 / 动作 / CLI 接口详解**见 [docs/ACT_Policy_Infer_Interface.md](docs/ACT_Policy_Infer_Interface.md)。
 
@@ -128,15 +129,16 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
   --camera-serial-dict.realsense-0 135522071053 \
   --camera-serial-dict.realsense-1 244222075136 \
   --enable-lerobot-log \
-  --lerobot-root data/lerobot/tb6r5_new \
-  --lerobot-repo-id local/tb6r5_new \
-  --lerobot-task "tb6r5 teleoperation 3 rings" \
+  --lerobot-root data/lerobot/tb6r5_test \
+  --lerobot-repo-id local/tb6r5_test \
+  --lerobot-task "tb6r5 teleoperation test" \
   --lerobot-streaming-encoding \
   --lerobot-overwrite \
   --lerobot-image-writer-processes 0 \
   --lerobot-image-writer-threads 4 \
   --lerobot-encoder-threads 2 \
-  --no-enable-camera-depth
+  --no-enable-camera-depth \
+  --g-model 3 --subloop 0 --cd-version 45
 ```
 
 > `--lerobot-overwrite` 会删除已有 `data/lerobot/tb6r5_live` 后重建。续采请改
@@ -226,9 +228,9 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--zone-ratio` | `0.05` | `JogAnyJ` zone_ratio |
-| `--joint-vel` | `6.0` | `JogAnyJ` 关节速度 |
-| `--joint-acc` | `3.0` | `JogAnyJ` 关节加速度 |
-| `--joint-dec` | `3.0` | `JogAnyJ` 关节减速度 |
+| `--joint-vel` | `1.0` | `JogAnyJ` 关节速度 |
+| `--joint-acc` | `1.0` | `JogAnyJ` 关节加速度 |
+| `--joint-dec` | `1.0` | `JogAnyJ` 关节减速度 |
 | `--sl-immediate` | off | SubLoop1 immediate 模式 |
 | `--safe-tcp-z-min-m` | `0.05` | TCP Z 下限（m），`None` 关闭 |
 | `--safe-tcp-z-max-m` | `0.65` | TCP Z 上限（m），`None` 关闭 |
@@ -259,7 +261,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 | `--gripper-min-d` | `0.0` | 最小距离 / 全闭合（mm），须与训练一致 |
 | `--two-fingers-gripper-interval` | `5.0` | `MoveTwoFingersGripper` interval |
 | `--gripper-observation-default` | `0.0` | 无反馈时的夹爪观测默认值 |
-| `--disable-gripper` | off | 禁用夹爪控制 |
+| `--g-model` | `2` | `0`=无夹爪单模型 RPC（`{Enable}`/`{JogAnyJ}`，无 `\|\|`）；`2`=MoveTwoFingers；`3`=JogAnyJ j1 |
 
 夹爪 RPC 固定 **2Hz**；与上次指令差小于 `two_fingers_gripper_cmd_delta`（控制器内部默认 0.5mm）时不重复下发。
 
@@ -321,7 +323,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 
 | 现象 | 可尝试 |
 |------|--------|
-| 臂动得慢、跟不上手 | `--scale-factor 2.0`、`--joint-vel 6~8`（默认 vel/acc/dec=`6/3/3`） |
+| 臂动得慢、跟不上手 | `--scale-factor 2.0`、`--joint-vel 2~6`（默认 vel/acc/dec=`1/1/1`） |
 | 录制卡顿拖累体感 | `--no-enable-camera-depth`、`--lerobot-encoder-threads 2`、减相机路数 |
 | Z 方向被挡住 | 检查 `--safe-tcp-z-min-m` / `--safe-tcp-z-max-m` |
 | 必须握把才动 | 默认 `--require-grip-to-send-commands`；松开 `right_grip` 即停 |
@@ -377,7 +379,7 @@ lerobot-record \
 | `--robot.enable_topic` | `true` | Topic 关节/夹爪反馈 |
 | `--robot.topic_wait_timeout_s` | `5.0` | 等待 Topic 超时（秒） |
 | `--robot.zone_ratio` | `0.0` | `JogAnyJ` zone_ratio |
-| `--robot.joint_vel` / `acc` / `dec` | `6.0` / `3.0` / `3.0` | `JogAnyJ` 运动参数 |
+| `--robot.joint_vel` / `acc` / `dec` | `1.0` / `1.0` / `1.0` | `JogAnyJ` 运动参数 |
 | `--robot.subloop1_immediate` | `false` | SubLoop1 immediate |
 | `--robot.gripper_max_d` | `70.0` | 夹爪最大张开（mm） |
 | `--robot.gripper_interval` | `25.0` | `MoveTwoFingersGripper` interval |
@@ -469,7 +471,7 @@ lerobot-record-pico-ctl \
 | `--teleop.two_fingers_gripper_interval` | `25.0` | 夹爪 interval |
 | `--teleop.two_fingers_gripper_cmd_delta` | `5.0` | 夹爪输入死区（mm） |
 | `--teleop.zone_ratio` | `0.0` | `JogAnyJ` zone_ratio |
-| `--teleop.joint_vel` / `acc` / `dec` | `6.0` / `3.0` / `3.0` | `JogAnyJ` 参数 |
+| `--teleop.joint_vel` / `acc` / `dec` | `1.0` / `1.0` / `1.0` | `JogAnyJ` 参数 |
 | `--teleop.subloop1_immediate` | `false` | SubLoop1 immediate |
 | `--teleop.safe_tcp_z_min_m` / `max_m` | `0.05` / `0.65` | TCP Z 限位 |
 | `--teleop.visualize_placo` | `false` | Placo Meshcat |

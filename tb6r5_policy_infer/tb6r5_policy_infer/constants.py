@@ -1,18 +1,14 @@
-"""Default configuration values for TB6-R5 ACT inference."""
+"""Default configuration values for TB6-R5 policy hardware inference."""
 
-from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
+from .hardware.tb6r5 import (
     DEFAULT_GRIPPER_MAX_D,
     DEFAULT_JOG_ANY_JOINT_ACC,
     DEFAULT_JOG_ANY_JOINT_DEC,
     DEFAULT_JOG_ANY_JOINT_VEL,
+    DEFAULT_SUBLOOP,
     DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
     DEFAULT_ZONE_RATIO,
-)
-from xrobotoolkit_teleop.hardware.tb6r5_teleop_controller import (
-    DEFAULT_GRIPPER_RPC_RATE_HZ,
-    DEFAULT_HOME_JOINT_DEG,
-    DEFAULT_REALSENSE_SERIAL_DICT,
-    DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA,
+    DEFAULT_CD_VERSION,
 )
 
 # Match scripts/hardware/record_tb6r5_lerobot.sh (GRIPPER_MIN_D=30).
@@ -20,10 +16,17 @@ DEFAULT_GRIPPER_MIN_D = 30.0
 
 DEFAULT_GRIPPER_OBSERVATION_MM = 0.0
 DEFAULT_HOME_SETTLE_TIME_S = 3.0
+DEFAULT_HOME_JOINT_DEG = (80, -70, 70, -90, -90, -60)
 # Match record_tb6r5_lerobot.sh CONTROL_RATE_HZ / LOG_FREQ.
 DEFAULT_CONTROL_FPS = 30.0
 # Arm/gripper SubLoop1 RPC rates for deployment (30 Hz arm, 2 Hz gripper).
 DEFAULT_ARM_RPC_RATE_HZ = 30.0
+DEFAULT_GRIPPER_RPC_RATE_HZ = 2.0
+DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA = 0.5
+DEFAULT_REALSENSE_SERIAL_DICT = {
+    "realsense_0": "135522071053",
+    "realsense_1": "327122073649",
+}
 
 # ANSI colors for gripper debug: green=open, red=close.
 GREEN = "\033[32m"
@@ -32,8 +35,12 @@ BOLD_GREEN = "\033[1;32m"
 BOLD_RED = "\033[1;31m"
 RESET = "\033[0m"
 
+# Runtime inference loop log prefix (distinct from [POLICY] deploy/config lines).
+INFER_LOG_PREFIX = "INFER"
+
 __all__ = [
     "DEFAULT_ARM_RPC_RATE_HZ",
+    "DEFAULT_CD_VERSION",
     "DEFAULT_CONTROL_FPS",
     "DEFAULT_GRIPPER_MAX_D",
     "DEFAULT_GRIPPER_MIN_D",
@@ -45,6 +52,7 @@ __all__ = [
     "DEFAULT_JOG_ANY_JOINT_DEC",
     "DEFAULT_JOG_ANY_JOINT_VEL",
     "DEFAULT_REALSENSE_SERIAL_DICT",
+    "DEFAULT_SUBLOOP",
     "DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA",
     "DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL",
     "DEFAULT_ZONE_RATIO",
@@ -52,5 +60,6 @@ __all__ = [
     "RED",
     "BOLD_GREEN",
     "BOLD_RED",
+    "INFER_LOG_PREFIX",
     "RESET",
 ]

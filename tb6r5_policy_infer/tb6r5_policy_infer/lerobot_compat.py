@@ -13,10 +13,7 @@ import draccus
 import torch
 from lerobot.configs.policies import PreTrainedConfig
 
-try:
-    from lerobot.utils.control_utils import predict_action
-except ModuleNotFoundError:
-    from lerobot.common.control_utils import predict_action
+from .constants import INFER_LOG_PREFIX
 
 
 def _install_groot_config_stub() -> None:
@@ -43,6 +40,37 @@ def _install_groot_config_stub() -> None:
     groot.configuration_groot = config_mod
     groot.GrootConfig = config_mod.GrootConfig
     sys.modules[groot_name] = groot
+
+
+def _transformers_hub_mismatch_help() -> str | None:
+    return (
+        "transformers and huggingface-hub versions are incompatible.\n"
+        "This project uses lerobot 0.5.x (SmolVLA / pi0 need transformers). Run:\n"
+        '  pip install "transformers>=5.3.0,<6.0.0" "huggingface-hub>=1.16.0,<2.0.0"\n'
+        "If you must stay on lerobot 0.4.x instead, pin the older pair:\n"
+        '  pip install "lerobot==0.4.4" "transformers>=4.57.1,<5.0.0" '
+        '"huggingface-hub>=0.34.2,<0.36.0"'
+    )
+
+
+def _import_predict_action():
+    _install_groot_config_stub()
+    try:
+        from lerobot.utils.control_utils import predict_action
+
+        return predict_action
+    except ModuleNotFoundError:
+        from lerobot.common.control_utils import predict_action
+
+        return predict_action
+    except ImportError as exc:
+        msg = str(exc)
+        if "huggingface-hub" in msg or "huggingface_hub" in msg:
+            raise ImportError(_transformers_hub_mismatch_help()) from exc
+        raise
+
+
+predict_action = _import_predict_action()
 
 
 def _dataclass_field_names(cls: type) -> set[str]:
@@ -106,7 +134,7 @@ def import_policy_factory():
                 "lerobot Groot policy failed to import (transformers dataclass conflict).\n"
                 "ACT eval does not need Groot. Sync latest tb6r5_policy_infer, or run:\n"
                 "  pip uninstall transformers -y\n"
-                "or upgrade: pip install \"lerobot>=0.5.1\" \"transformers>=5.3.0\" "
+                'or upgrade: pip install "lerobot>=0.5.1" "transformers>=5.3.0" '
                 '"huggingface-hub>=1.16.0,<2.0.0"'
             ) from exc
         raise
@@ -128,10 +156,10 @@ def resolve_inference_device(device: str) -> str:
     if requested == "auto":
         if _cuda_usable():
             return "cuda"
-        print("[ACT] CUDA unavailable, using CPU (pass --device cuda to override when GPU is ready)")
+        print(f"[{INFER_LOG_PREFIX}] CUDA unavailable, using CPU (pass --device cuda to override when GPU is ready)")
         return "cpu"
     if requested.startswith("cuda") and not _cuda_usable():
-        print(f"[ACT] WARNING: --device {device} requested but CUDA unavailable, using CPU")
+        print(f"[{INFER_LOG_PREFIX}] WARNING: --device {device} requested but CUDA unavailable, using CPU")
         return "cpu"
     return device
 

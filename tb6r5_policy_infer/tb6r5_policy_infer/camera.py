@@ -1,4 +1,4 @@
-"""Camera streaming for TB6-R5 ACT inference (RealSense, V4L2, or HTTP URL)."""
+"""Camera streaming for TB6-R5 policy inference (RealSense, V4L2, or HTTP URL)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import time
 from typing import Protocol
 
 import numpy as np
+
+from .constants import INFER_LOG_PREFIX
 
 
 class CameraStreamProtocol(Protocol):
@@ -42,7 +44,7 @@ def show_camera_rgb(images: dict[str, np.ndarray]) -> None:
         if rgb is None:
             continue
         bgr = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
-        window = f"ACT RGB - {name}"
+        window = f"{INFER_LOG_PREFIX} RGB - {name}"
         if window not in _PREVIEW_WINDOWS:
             cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
             _PREVIEW_WINDOWS.add(window)
@@ -141,7 +143,7 @@ def create_camera_stream(
     url_dict = parse_camera_urls(camera_urls)
     if url_dict:
         if camera_serials or camera_devices:
-            print("[ACT][camera] --camera-urls set; ignoring --camera-serials and --camera-devices")
+            print(f"[{INFER_LOG_PREFIX}][camera] --camera-urls set; ignoring --camera-serials and --camera-devices")
         names = sorted(url_dict.keys())
         stream = HttpCameraStream(url_dict, width, height, fps)
         return stream, names
@@ -149,7 +151,7 @@ def create_camera_stream(
     device_dict = parse_camera_devices(camera_devices)
     if device_dict:
         if camera_serials:
-            print("[ACT][camera] --camera-devices set; ignoring --camera-serials")
+            print(f"[{INFER_LOG_PREFIX}][camera] --camera-devices set; ignoring --camera-serials")
         names = sorted(device_dict.keys())
         stream = V4l2CameraStream(device_dict, width, height, fps)
         return stream, names
@@ -164,7 +166,7 @@ class RealSenseCameraStream:
     """Owns a RealSenseCameraInterface plus a background polling thread."""
 
     def __init__(self, serial_dict: dict[str, str], width: int, height: int, fps: int):
-        from xrobotoolkit_teleop.hardware.interface.realsense import RealSenseCameraInterface
+        from .hardware.realsense import RealSenseCameraInterface
 
         self.serial_dict = serial_dict
         self.serial_to_name = {serial: name for name, serial in serial_dict.items()}
@@ -176,7 +178,6 @@ class RealSenseCameraStream:
             fps=fps,
             serial_numbers=list(serial_dict.values()),
             enable_depth=False,
-            enable_compression=False,
         )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -191,7 +192,7 @@ class RealSenseCameraStream:
             try:
                 self.cam.update_frames()
             except Exception as exc:
-                print(f"[ACT][camera] update_frames error: {exc}")
+                print(f"[{INFER_LOG_PREFIX}][camera] update_frames error: {exc}")
                 time.sleep(0.02)
 
     def wait_ready(self, timeout_s: float = 10.0) -> None:
@@ -200,10 +201,10 @@ class RealSenseCameraStream:
         while time.time() < deadline:
             frames = self.cam.get_frames()
             if needed.issubset(set(frames.keys())):
-                print("[ACT][camera] all RealSense cameras streaming")
+                print(f"[{INFER_LOG_PREFIX}][camera] all RealSense cameras streaming")
                 return
             time.sleep(0.1)
-        print("[ACT][camera] WARNING: not all RealSense cameras produced frames before timeout")
+        print(f"[{INFER_LOG_PREFIX}][camera] WARNING: not all RealSense cameras produced frames before timeout")
 
     def get_images(self) -> dict[str, np.ndarray]:
         frames = self.cam.get_frames()
@@ -259,7 +260,7 @@ class V4l2CameraStream:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             cap.set(cv2.CAP_PROP_FPS, self.fps)
             self._caps[name] = cap
-            print(f"[ACT][camera] opened V4L2 '{name}' -> {device}")
+            print(f"[{INFER_LOG_PREFIX}][camera] opened V4L2 '{name}' -> {device}")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -286,10 +287,10 @@ class V4l2CameraStream:
             with self._lock:
                 ready = needed.issubset(set(self._frames.keys()))
             if ready:
-                print("[ACT][camera] all V4L2 cameras streaming")
+                print(f"[{INFER_LOG_PREFIX}][camera] all V4L2 cameras streaming")
                 return
             time.sleep(0.1)
-        print("[ACT][camera] WARNING: not all V4L2 cameras produced frames before timeout")
+        print(f"[{INFER_LOG_PREFIX}][camera] WARNING: not all V4L2 cameras produced frames before timeout")
 
     def get_images(self) -> dict[str, np.ndarray]:
         with self._lock:
@@ -303,7 +304,7 @@ class V4l2CameraStream:
             try:
                 cap.release()
             except Exception as exc:
-                print(f"[ACT][camera] release '{name}' error: {exc}")
+                print(f"[{INFER_LOG_PREFIX}][camera] release '{name}' error: {exc}")
         self._caps.clear()
 
 
@@ -383,12 +384,12 @@ class HttpCameraStream:
                             buf = buf[-200_000:]
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if not self._stop.is_set():
-                    print(f"[ACT][camera] HTTP stream '{name}' disconnected: {exc}")
+                    print(f"[{INFER_LOG_PREFIX}][camera] HTTP stream '{name}' disconnected: {exc}")
                 time.sleep(0.3)
 
     def start(self) -> None:
         for name, url in self.url_dict.items():
-            print(f"[ACT][camera] opened HTTP '{name}' -> {url}")
+            print(f"[{INFER_LOG_PREFIX}][camera] opened HTTP '{name}' -> {url}")
             thread = threading.Thread(target=self._camera_loop, args=(name, url), daemon=True)
             thread.start()
             self._threads.append(thread)
@@ -400,10 +401,10 @@ class HttpCameraStream:
             with self._lock:
                 ready = needed.issubset(set(self._frames.keys()))
             if ready:
-                print("[ACT][camera] all HTTP cameras streaming")
+                print(f"[{INFER_LOG_PREFIX}][camera] all HTTP cameras streaming")
                 return
             time.sleep(0.1)
-        print("[ACT][camera] WARNING: not all HTTP cameras produced frames before timeout")
+        print(f"[{INFER_LOG_PREFIX}][camera] WARNING: not all HTTP cameras produced frames before timeout")
 
     def get_images(self) -> dict[str, np.ndarray]:
         with self._lock:

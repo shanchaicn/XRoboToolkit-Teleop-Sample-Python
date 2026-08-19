@@ -11,7 +11,13 @@ Usage:
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode placo_ik --zone-ratio 0.05
     # right_grip: move arm; right_trigger: gripper (--require-joystick-arm enables right_axis_click gate)
     # A: discard + home; B: toggle logging
+    # --debug-grip: print right_grip on ON/OFF edges + ~5 Hz heartbeat (grip + trigger)
+    # --g-model 0: arm-only (no gripper, single-model RPC); 2: MoveTwoFingersGripper; 3: JogAnyJ j1 gripper
+    # --subloop 1 (default): SubLoop1 --exec nesting; --subloop 0: direct (g_model=0 → {JogAnyJ}; else {arm||grip})
     python scripts/hardware/teleop_tb6r5_hardware.py --scale-factor 2.0 --cartesian-max-step-pos-m 0.05
+    python scripts/hardware/teleop_tb6r5_hardware.py --g-model 0 --no-enable-log-data --no-enable-camera
+    python scripts/hardware/teleop_tb6r5_hardware.py --g-model 3 --cd-version 45 --enable-log-data --enable-lerobot-log
+    python scripts/hardware/teleop_tb6r5_hardware.py --g-model 3 --subloop 0
     python scripts/hardware/teleop_tb6r5_hardware.py --teleop-mode jog_any_c --cartesian-vel 1.0 --cartesian-acc 1.0 --cartesian-dec 1.0
     python scripts/hardware/teleop_tb6r5_hardware.py --jog-any-c-preview
     python scripts/visualization/vis_jog_any_c_robottarget.py
@@ -26,10 +32,15 @@ Usage:
 import tyro
 
 from xrobotoolkit_teleop.hardware.interface.tb6r5 import (
+    DEFAULT_CD_VERSION,
+    DEFAULT_G_MODEL,
+    G_MODELS,
+    DEFAULT_GRIPPER_G3_MAX_D,
     DEFAULT_JOG_ANY_C_ASYNC_TIMEOUT_MS,
     DEFAULT_JOG_ANY_JOINT_ACC,
     DEFAULT_JOG_ANY_JOINT_DEC,
     DEFAULT_JOG_ANY_JOINT_VEL,
+    DEFAULT_SUBLOOP,
     DEFAULT_TELEOP_MODE,
     TeleopMode,
 )
@@ -93,6 +104,9 @@ def main(
     control_rate_hz: int = 50,
     arm_rpc_rate_hz: float = DEFAULT_ARM_RPC_RATE_HZ,
     gripper_rpc_rate_hz: float = DEFAULT_GRIPPER_RPC_RATE_HZ,
+    g_model: int = DEFAULT_G_MODEL,
+    cd_version: int = DEFAULT_CD_VERSION,
+    subloop: int = DEFAULT_SUBLOOP,
     enable_log_data: bool = True,
     enable_lerobot_log: bool = False,
     lerobot_root: str = "data/lerobot/tb6r5_live",
@@ -123,12 +137,13 @@ def main(
     gripper_max_d: float = DEFAULT_GRIPPER_MAX_D,
     gripper_min_d: float = DEFAULT_GRIPPER_MIN_D,
     two_fingers_gripper_interval: float = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL,
-    disable_gripper: bool = False,
+    gripper_threshold: bool = False,
     require_grip_to_send_commands: bool = True,
     require_joystick_arm: bool = False,
     teleop_arm_button: str = DEFAULT_TELEOP_ARM_BUTTON,
     teleop_mode: TeleopMode = DEFAULT_TELEOP_MODE,
     jog_any_c_preview: bool = False,
+    debug_grip: bool = False,
 ):
     if jog_any_c_preview:
         robot_ip = "none"
@@ -136,6 +151,17 @@ def main(
         visualize_placo = True
         enable_log_data = False
         enable_camera = False
+
+    if g_model not in G_MODELS:
+        raise ValueError(f"--g-model must be one of {G_MODELS}, got {g_model}")
+    if cd_version not in (44, 45):
+        raise ValueError(f"--cd-version must be 44 or 45, got {cd_version}")
+    if subloop not in (0, 1):
+        raise ValueError(f"--subloop must be 0 or 1, got {subloop}")
+    if g_model == 3 and abs(float(gripper_max_d) - DEFAULT_GRIPPER_MAX_D) < 1e-9:
+        gripper_max_d = DEFAULT_GRIPPER_G3_MAX_D
+    if g_model == 3:
+        gripper_rpc_rate_hz = float(arm_rpc_rate_hz)
 
     controller = TB6R5TeleopController(
         robot_urdf_path=robot_urdf_path,
@@ -167,6 +193,9 @@ def main(
         control_rate_hz=control_rate_hz,
         arm_rpc_rate_hz=arm_rpc_rate_hz,
         gripper_rpc_rate_hz=gripper_rpc_rate_hz,
+        g_model=g_model,
+        cd_version=cd_version,
+        subloop=subloop,
         enable_log_data=enable_log_data,
         enable_lerobot_log=enable_lerobot_log,
         lerobot_root=lerobot_root,
@@ -197,10 +226,11 @@ def main(
         gripper_max_d=gripper_max_d,
         gripper_min_d=gripper_min_d,
         two_fingers_gripper_interval=two_fingers_gripper_interval,
-        disable_gripper=disable_gripper,
+        gripper_threshold=gripper_threshold,
         require_grip_to_send_commands=require_grip_to_send_commands,
         require_joystick_arm=require_joystick_arm,
         teleop_arm_button=teleop_arm_button,
+        debug_grip=debug_grip,
     )
     controller.run()
 
