@@ -345,7 +345,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py --help
 | 参数 | 默认值 |
 |------|--------|
 | `--camera-serial-dict.realsense-0` | `135522071053` |
-| `--camera-serial-dict.realsense-1` | `347622071274` |
+| `--camera-serial-dict.realsense-1` | `327122073649` |
 
 逻辑名必须为 `realsense_0` / `realsense_1`，与 LeRobot 数据集字段一致。详见 §1.1。
 
