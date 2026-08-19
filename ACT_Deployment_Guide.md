@@ -114,6 +114,45 @@ pip install -e ./lerobot_teleoperator_pico_ctl_tb6r5 --no-deps # B2
 
 当前可用 RealSense 序列号：`244222075136` / `135522071053` / `347622071274`。
 
+#### LeRobot 录制常见参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--enable-lerobot-log` | off | **必开才录制**；会自动打开内部 log 线程 |
+| `--robot-ip` | `192.168.11.11` | 机器人 IP |
+| `--lerobot-root` | `data/lerobot/tb6r5_live` | 数据集保存目录 |
+| `--lerobot-repo-id` | `local/tb6r5_live` | repo id（须与目录内 `meta/info.json` 一致） |
+| `--lerobot-task` | `tb6r5 teleoperation` | 每帧 task 文本 |
+| `--lerobot-overwrite` | off | 清空已有 root 后新建（与 resume 二选一） |
+| `--lerobot-resume` | off | 在已有数据集上续采 |
+| `--lerobot-streaming-encoding` | on | 流式视频编码，B 键保存更快 |
+| `--lerobot-image-writer-processes` | `0` | PNG 写盘进程数（流式编码时一般 0） |
+| `--lerobot-image-writer-threads` | `4` | 每路相机写线程 |
+| `--lerobot-encoder-threads` | `2` | 视频编码线程 |
+| `--lerobot-include-depth` | off | 是否把 depth 写入数据集（训练通常不需要） |
+| `--log-freq` | `20` | 数据集 fps（建议与 `--control-rate-hz` 一致） |
+| `--enable-camera` | on | 开相机；录制 RGB 需要保持开启 |
+| `--enable-camera-depth` | off | 预览是否拉 depth（默认关） |
+| `--camera-width` / `--camera-height` | `640` / `480` | 分辨率 |
+| `--camera-fps` | `30` | 相机拉流帧率 |
+
+手柄：**B** 开始/结束并保存 episode；**A** 丢弃当前段。
+
+#### 相机设置方式（三选一，优先级：URL > V4L2 > RealSense）
+
+逻辑相机名固定为 `realsense_0` / `realsense_1`（写入 `observation.images.realsense_*`）。
+
+| 方式 | 参数 | 适用 | 示例 |
+|------|------|------|------|
+| **1. RealSense USB** | `--camera-serial-dict.realsense-0/1` | 本机 `pyrealsense2` | 见下方「仅遥操作 / 录制」示例 |
+| **2. V4L2** | `--camera-devices` | 无 pyrealsense2，用 `/dev/video*` | `'realsense_0=/dev/video0,realsense_1=/dev/video4'` |
+| **3. HTTP** | `--camera-urls` | 远程 JPEG/流 | `'realsense_0=http://host:8888/.../color,...'` |
+
+说明：
+- 指定了 `--camera-devices` 或 `--camera-urls` 后，**忽略** `--camera-serial-dict.*`
+- V4L2 / HTTP **无 depth**；勿加 `--lerobot-include-depth`
+- RealSense 默认序列号：`realsense_0=135522071053`，`realsense_1=327122073649`（可按现场改）
+
 #### 仅遥操作（不录制）
 
 ```bash
@@ -135,7 +174,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
   --lerobot-overwrite
 ```
 
-完整示例（显式写出相机序列号与常用调参）：
+完整示例（方式 1：RealSense 序列号）：
 
 ```bash
 python scripts/hardware/teleop_tb6r5_hardware.py \
@@ -161,7 +200,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
 
 > `--enable-lerobot-log` 会自动打开 `enable-log-data`。`--lerobot-overwrite` 会删除已有 root 后重建；续采用 `--lerobot-resume`（不要同时 overwrite）。
 
-#### 采集：V4L2 相机（无 pyrealsense2）
+#### 采集：方式 2 — V4L2（无 pyrealsense2）
 
 ```bash
 python scripts/hardware/teleop_tb6r5_hardware.py \
@@ -174,7 +213,7 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
   --lerobot-streaming-encoding
 ```
 
-#### 采集：HTTP 远程相机
+#### 采集：方式 3 — HTTP 远程相机
 
 ```bash
 python scripts/hardware/teleop_tb6r5_hardware.py \
@@ -185,9 +224,6 @@ python scripts/hardware/teleop_tb6r5_hardware.py \
   --lerobot-root data/lerobot/tb6r5_live \
   --lerobot-repo-id local/tb6r5_live
 ```
-
-> 设置 `--camera-urls` 或 `--camera-devices` 后忽略 `--camera-serial-dict.*`。
-> V4L2/HTTP 模式不支持 depth（默认已关 depth；勿加 `--lerobot-include-depth`）。
 
 ### 2.2 VR 手柄操作
 
