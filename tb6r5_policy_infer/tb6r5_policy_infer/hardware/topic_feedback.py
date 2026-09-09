@@ -155,7 +155,7 @@ def validate_topic_sdk() -> None:
 
 
 class TopicFeedback:
-    """Background reader for joint positions and gripper feedback."""
+    """Background reader for joints, TCP robottarget, and gripper feedback."""
 
     def __init__(
         self,
@@ -182,7 +182,12 @@ class TopicFeedback:
         self._healthy = False
         self._q = np.zeros(self.joint_count)
         self._dq = np.zeros(self.joint_count)
+        self._tcp_xyz = np.zeros(3, dtype=float)
+        # Wire / policy order: qx,qy,qz,qw
+        self._tcp_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+        self._robottarget_healthy = False
         self._gripper_mm: float | None = None
+        self._gripper_m: float | None = None
         self._gripper_healthy = False
 
     def _gripper_joint_to_mm(self, j1_m: float) -> float:
@@ -192,29 +197,39 @@ class TopicFeedback:
         t = (float(j1_m) - j_lo) / span
         return max(0.0, min(t, 1.0)) * self.gripper_jog_mm_full_scale
 
-    def _read_gripper_mm_from_model1(self) -> tuple[float | None, bool]:
-        """g_model=3: models[1].joint[0].position (meters) → mm."""
-        if self._topic is None:
-            return None, False
+    @staticmethod
+    def _parse_robottarget_value(rt_value) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Parse Topic robottarget {x,y,z,qx,qy,qz,qw} -> xyz, quat_xyzw."""
         try:
-            state = self._topic.get_system_state()
-            if not state.has_rt():
-                return None, False
-            rt = state.get_rt()
+            if rt_value is None:
+                return np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), False
+            if hasattr(rt_value, "__len__"):
+                vals = [float(v) for v in rt_value]
+            else:
+                return np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), False
+            if len(vals) < 7:
+                return np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), False
+            xyz = np.array(vals[:3], dtype=float)
+            quat_xyzw = np.array([vals[3], vals[4], vals[5], vals[6]], dtype=float)
+            return xyz, quat_xyzw, True
+        except (TypeError, ValueError):
+            return np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), False
+
+    def _read_gripper_from_model1(self, rt) -> tuple[float | None, float | None, bool]:
+        """g_model=3: models[1].j0 position (meters) -> (mm, m, ok)."""
+        try:
             if not rt.models or len(rt.models) < 2:
-                return None, False
+                return None, None, False
             model = rt.models[1]
             start = int(getattr(model, "joint_start_idx", 0) or 0)
             if start < 0 or start >= len(rt.models_joints):
-                return None, False
+                return None, None, False
             pos_m = float(rt.models_joints[start].position)
-            return self._gripper_joint_to_mm(pos_m), True
+            return self._gripper_joint_to_mm(pos_m), pos_m, True
         except Exception:
-            return None, False
+            return None, None, False
 
-    def _read_gripper_mm(self) -> tuple[float | None, bool]:
-        if self.g_model == 3:
-            return self._read_gripper_mm_from_model1()
+    def _read_gripper_mm_nrt(self) -> tuple[float | None, bool]:
         if self._topic is None:
             return None, False
         try:
@@ -265,10 +280,15 @@ class TopicFeedback:
             self._thread.join(timeout=1.0)
             self._thread = None
         self._healthy = False
+        self._robottarget_healthy = False
 
     def is_healthy(self) -> bool:
         with self._lock:
             return self._healthy
+
+    def is_robottarget_healthy(self) -> bool:
+        with self._lock:
+            return self._robottarget_healthy
 
     def get_joint_positions(self) -> np.ndarray:
         with self._lock:
@@ -278,49 +298,97 @@ class TopicFeedback:
         with self._lock:
             return self._dq.copy()
 
+    def get_robottarget(self) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Current TCP pose: xyz (m), quat_xyzw, healthy."""
+        with self._lock:
+            return (
+                self._tcp_xyz.copy(),
+                self._tcp_quat_xyzw.copy(),
+                bool(self._robottarget_healthy),
+            )
+
     def get_gripper_distance_mm(self) -> float | None:
         with self._lock:
             return None if self._gripper_mm is None else float(self._gripper_mm)
+
+    def get_gripper_distance_m(self) -> float | None:
+        """Gripper opening in meters (g_model=3: raw j1; else mm/1000)."""
+        with self._lock:
+            if self._gripper_m is not None:
+                return float(self._gripper_m)
+            if self._gripper_mm is None:
+                return None
+            return float(self._gripper_mm) / 1000.0
 
     def is_gripper_feedback_healthy(self) -> bool:
         with self._lock:
             return self._gripper_healthy
 
-    def _read_joints(self) -> tuple[np.ndarray, np.ndarray, bool]:
+    def _read_rt_bundle(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, bool, np.ndarray, np.ndarray, bool, float | None, float | None, bool]:
+        """One Topic RT sample: joints + robottarget + gripper."""
+        q = self._q.copy()
+        dq = self._dq.copy()
+        xyz = self._tcp_xyz.copy()
+        quat = self._tcp_quat_xyzw.copy()
         if self._topic is None:
-            return self._q.copy(), self._dq.copy(), False
+            return q, dq, False, xyz, quat, False, None, None, False
         try:
             state = self._topic.get_system_state()
             if not state.has_rt():
-                return self._q.copy(), self._dq.copy(), False
+                return q, dq, False, xyz, quat, False, None, None, False
             rt = state.get_rt()
-            if not rt.models:
-                return self._q.copy(), self._dq.copy(), False
-            model = rt.models[0]
-            start = model.joint_start_idx
-            n_model = int(getattr(model, "joint_count", 0) or 0)
-            if n_model <= 0:
-                return self._q.copy(), self._dq.copy(), False
-            q = np.zeros(self.joint_count)
-            dq = np.zeros(self.joint_count)
-            for j in range(start, min(start + n_model, start + self.joint_count)):
-                joint = rt.models_joints[j]
-                q[j - start] = joint.position
-                dq[j - start] = joint.velocity
-            return q, dq, True
+            joints_ok = False
+            tcp_ok = False
+            if rt.models:
+                model = rt.models[0]
+                start = model.joint_start_idx
+                n_model = int(getattr(model, "joint_count", 0) or 0)
+                if n_model > 0:
+                    q = np.zeros(self.joint_count)
+                    dq = np.zeros(self.joint_count)
+                    for j in range(start, min(start + n_model, start + self.joint_count)):
+                        joint = rt.models_joints[j]
+                        q[j - start] = joint.position
+                        dq[j - start] = joint.velocity
+                    joints_ok = True
+                if hasattr(rt, "models_current_points") and len(rt.models_current_points) > 0:
+                    cur = rt.models_current_points[0]
+                    xyz, quat, tcp_ok = self._parse_robottarget_value(getattr(cur, "robottarget", None))
+
+            grip_mm: float | None = None
+            grip_m: float | None = None
+            grip_ok = False
+            if self.g_model == 3:
+                grip_mm, grip_m, grip_ok = self._read_gripper_from_model1(rt)
+            else:
+                grip_mm, grip_ok = self._read_gripper_mm_nrt()
+                if grip_ok and grip_mm is not None:
+                    grip_m = float(grip_mm) / 1000.0
+            return q, dq, joints_ok, xyz, quat, tcp_ok, grip_mm, grip_m, grip_ok
         except Exception:
-            return self._q.copy(), self._dq.copy(), False
+            return q, dq, False, xyz, quat, False, None, None, False
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            q, dq, ok = self._read_joints()
-            gripper_mm, gripper_ok = self._read_gripper_mm()
+            q, dq, joints_ok, xyz, quat, tcp_ok, grip_mm, grip_m, grip_ok = self._read_rt_bundle()
+            # g_model=2 gripper is NRT; refresh separately if RT path had no grip.
+            if self.g_model != 3 and not grip_ok:
+                grip_mm, grip_ok = self._read_gripper_mm_nrt()
+                if grip_ok and grip_mm is not None:
+                    grip_m = float(grip_mm) / 1000.0
             with self._lock:
-                if ok:
+                if joints_ok:
                     self._q = q
                     self._dq = dq
                     self._healthy = True
-                if gripper_ok:
-                    self._gripper_mm = gripper_mm
+                if tcp_ok:
+                    self._tcp_xyz = xyz
+                    self._tcp_quat_xyzw = quat
+                    self._robottarget_healthy = True
+                if grip_ok:
+                    self._gripper_mm = grip_mm
+                    self._gripper_m = grip_m
                     self._gripper_healthy = True
             time.sleep(self.poll_dt)

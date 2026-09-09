@@ -51,14 +51,22 @@ gripper_normalized: false
 # gripper_interval: 25.0
 
 # --- camera (pick one mode; urls > devices > serials) ---
+# 逻辑名须与训练 observation.images.<name> 一致；换机只改 = 右侧
 no_camera: false
 show_camera: true
 camera_width: 640
 camera_height: 480
 camera_fps: 30
-# camera_serials: "realsense_0=135522071053,realsense_1=327122073649"
+camera_preview_fps: 15
+camera_serials: "realsense_0=135522071053,realsense_1=244222075136"
 # camera_devices: "realsense_0=/dev/video0,realsense_1=/dev/video4"
 # camera_urls: "realsense_0=http://192.168.11.11:8888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:8888/RsCameraSensor/1/0/color"
+
+# --- Action space ---
+# joints (default): observation/action = [j0..j5, gripper_mm], JogAnyJ
+# ee_pose: observation/action = [x,y,z,qx,qy,qz,qw,gripper_m], Topic robottarget + JogAnyC
+# action_space: ee_pose
+# ee_step_max_m: 0.03
 
 # --- ACT optional ---
 # n_action_steps: 10

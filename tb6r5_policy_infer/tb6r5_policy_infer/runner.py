@@ -11,6 +11,14 @@ from .lerobot_compat import predict_action
 
 from .camera import CameraPreview, create_camera_stream, destroy_camera_windows, parse_camera_serials
 from .constants import BOLD_GREEN, DEFAULT_REALSENSE_SERIAL_DICT, INFER_LOG_PREFIX, RESET
+from .ee_pose import (
+    canonicalize_quat_xyzw,
+    clamp_ee_step,
+    gripper_m_to_mm,
+    gripper_mm_to_m,
+    pack_ee_state_xyzw,
+    unpack_ee_action_xyzw,
+)
 from .gripper import (
     clamp_joint_step,
     clip_gripper_mm,
@@ -103,6 +111,12 @@ def run_inference(args) -> int:
         if args.gripper_edge_min_interval < 0:
             raise ValueError("--gripper-edge-min-interval must be >= 0")
 
+    action_space = str(getattr(args, "action_space", "joints")).strip().lower()
+    if action_space not in ("joints", "ee_pose"):
+        raise ValueError(f"--action-space must be 'joints' or 'ee_pose', got {action_space!r}")
+    if action_space == "ee_pose" and args.gripper_normalized:
+        raise ValueError("--gripper-normalized is not supported with --action-space ee_pose (use gripper_m)")
+
     policy, preprocessor, postprocessor = load_policy_components(
         policy_path=args.policy_path,
         dataset_root=args.dataset_root,
@@ -156,6 +170,7 @@ def run_inference(args) -> int:
             print_rpc=args.print_rpc,
             g_model=g_model,
             cd_version=args.cd_version,
+            subloop=int(getattr(args, "subloop", 1)),
         )
         arm.connect()
         print(
@@ -195,6 +210,7 @@ def run_inference(args) -> int:
             joint_dec=args.joint_dec,
             g_model=g_model,
             cd_version=args.cd_version,
+            subloop=int(getattr(args, "subloop", 1)),
         )
     rpc_stream_count = 0
 
@@ -243,6 +259,7 @@ def run_inference(args) -> int:
     print(f"[{INFER_LOG_PREFIX}] Inference loop started. Press Ctrl+C to stop.")
     print(
         f"[{INFER_LOG_PREFIX}] Control loop {args.fps:.0f} Hz | "
+        f"action_space={action_space} | "
         f"arm RPC {args.arm_rpc_rate_hz:.0f} Hz | gripper RPC {args.gripper_rpc_rate_hz:.0f} Hz | "
         f"g_model={g_model} ({grip_rpc_label})"
     )
@@ -252,24 +269,52 @@ def run_inference(args) -> int:
 
             if arm is not None:
                 q_current = np.asarray(arm.get_joint_positions(), dtype=np.float32)[:6]
+                xyz_current, quat_xyzw_current, tcp_ok = arm.get_robottarget()
+                xyz_current = np.asarray(xyz_current, dtype=np.float32)
+                quat_xyzw_current = canonicalize_quat_xyzw(quat_xyzw_current)
             else:
                 q_current = np.zeros(6, dtype=np.float32)
+                xyz_current = np.zeros(3, dtype=np.float32)
+                quat_xyzw_current = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                tcp_ok = False
 
             gripper_obs_mm = clip_gripper_mm(
                 resolve_gripper_observation_mm(arm, args.gripper_observation_constant),
                 args.gripper_min_distance,
                 args.gripper_max_distance,
             )
-            if args.gripper_normalized:
-                gripper_obs = gripper_mm_to_normalized(gripper_obs_mm, args.gripper_max_distance)
-            else:
-                gripper_obs = gripper_obs_mm
-            observation = {
-                "observation.state": np.concatenate(
-                    [q_current, np.array([gripper_obs], dtype=np.float32)],
-                    axis=0,
+            if action_space == "ee_pose":
+                if arm is not None and hasattr(arm, "get_gripper_distance_m"):
+                    grip_m = arm.get_gripper_distance_m()
+                    if grip_m is None:
+                        grip_m = gripper_mm_to_m(gripper_obs_mm)
+                else:
+                    grip_m = gripper_mm_to_m(gripper_obs_mm)
+                grip_m = float(
+                    np.clip(
+                        grip_m,
+                        args.gripper_min_distance / 1000.0,
+                        args.gripper_max_distance / 1000.0,
+                    )
                 )
-            }
+                gripper_obs = grip_m
+                if arm is not None and not tcp_ok:
+                    # Keep last zeros only on first frames; still feed policy.
+                    pass
+                observation = {
+                    "observation.state": pack_ee_state_xyzw(xyz_current, quat_xyzw_current, grip_m)
+                }
+            else:
+                if args.gripper_normalized:
+                    gripper_obs = gripper_mm_to_normalized(gripper_obs_mm, args.gripper_max_distance)
+                else:
+                    gripper_obs = gripper_obs_mm
+                observation = {
+                    "observation.state": np.concatenate(
+                        [q_current, np.array([gripper_obs], dtype=np.float32)],
+                        axis=0,
+                    )
+                }
 
             if cam_stream is not None:
                 imgs = cam_stream.get_images()
@@ -293,27 +338,46 @@ def run_inference(args) -> int:
                 robot_type="tb6r5",
             )
             action = action_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32)
-            if action.shape[0] < 7:
-                raise ValueError(f"Expected action dim >= 7, got {action.shape}")
 
-            q_target = action[:6]
-            q_cmd = clamp_joint_step(q_target, q_current, args.joint_step_max_rad)
-
-            gripper_raw = float(action[6])
-            now = time.time()
-            sent = False
-            if args.gripper_normalized:
+            ee_xyz_cmd = None
+            ee_quat_xyzw_cmd = None
+            q_target = q_current
+            q_cmd = q_current
+            if action_space == "ee_pose":
+                xyz_tgt, quat_xyzw_tgt, gripper_raw_m = unpack_ee_action_xyzw(action)
+                ee_xyz_cmd = clamp_ee_step(
+                    xyz_tgt,
+                    xyz_current,
+                    getattr(args, "ee_step_max_m", None),
+                )
+                ee_quat_xyzw_cmd = canonicalize_quat_xyzw(quat_xyzw_tgt)
+                gripper_raw = gripper_raw_m
                 gripper_cmd_mm = clip_gripper_mm(
-                    gripper_normalized_to_mm(gripper_raw, args.gripper_max_distance),
+                    gripper_m_to_mm(gripper_raw_m),
                     args.gripper_min_distance,
                     args.gripper_max_distance,
                 )
             else:
-                gripper_cmd_mm = clip_gripper_mm(
-                    gripper_raw,
-                    args.gripper_min_distance,
-                    args.gripper_max_distance,
-                )
+                if action.shape[0] < 7:
+                    raise ValueError(f"Expected action dim >= 7, got {action.shape}")
+                q_target = action[:6]
+                q_cmd = clamp_joint_step(q_target, q_current, args.joint_step_max_rad)
+                gripper_raw = float(action[6])
+                if args.gripper_normalized:
+                    gripper_cmd_mm = clip_gripper_mm(
+                        gripper_normalized_to_mm(gripper_raw, args.gripper_max_distance),
+                        args.gripper_min_distance,
+                        args.gripper_max_distance,
+                    )
+                else:
+                    gripper_cmd_mm = clip_gripper_mm(
+                        gripper_raw,
+                        args.gripper_min_distance,
+                        args.gripper_max_distance,
+                    )
+
+            now = time.time()
+            sent = False
             send_gripper = False
             edge_accepted = False
 
@@ -378,14 +442,25 @@ def run_inference(args) -> int:
                     )
 
                 if arm is not None:
-                    sent = arm.set_joint_positions_with_gripper(
-                        q_cmd,
-                        gripper_mm_for_rpc,
-                        interval=args.gripper_interval,
-                        max_distance=args.gripper_max_distance,
-                        min_distance=args.gripper_min_distance,
-                        cmd_delta=gripper_cmd_delta,
-                    )
+                    if action_space == "ee_pose":
+                        sent = arm.set_cartesian_target_with_gripper(
+                            ee_xyz_cmd,
+                            ee_quat_xyzw_cmd,
+                            gripper_mm_for_rpc,
+                            interval=args.gripper_interval,
+                            max_distance=args.gripper_max_distance,
+                            min_distance=args.gripper_min_distance,
+                            cmd_delta=gripper_cmd_delta,
+                        )
+                    else:
+                        sent = arm.set_joint_positions_with_gripper(
+                            q_cmd,
+                            gripper_mm_for_rpc,
+                            interval=args.gripper_interval,
+                            max_distance=args.gripper_max_distance,
+                            min_distance=args.gripper_min_distance,
+                            cmd_delta=gripper_cmd_delta,
+                        )
                     if gripper_will_send:
                         last_gripper_sent_mm = gripper_mm_for_rpc
                     if not args.gripper_continuous and gripper_will_send and pending_gripper_mm is not None:
@@ -395,14 +470,25 @@ def run_inference(args) -> int:
                     if gripper_will_send:
                         last_gripper_sent_mm = gripper_mm_for_rpc
                     if rpc_formatter is not None:
-                        preview_cmd = rpc_formatter.build_subloop1_stream_cmd(
-                            q_cmd,
-                            gripper_mm_for_rpc if gripper_will_send else None,
-                            clear_buffer=0 if rpc_stream_count == 0 else 1,
-                            interval=args.gripper_interval,
-                            max_distance=args.gripper_max_distance,
-                            min_distance=args.gripper_min_distance,
-                        )
+                        if action_space == "ee_pose":
+                            preview_cmd = rpc_formatter.build_cartesian_stream_cmd(
+                                ee_xyz_cmd,
+                                ee_quat_xyzw_cmd,
+                                gripper_mm_for_rpc if gripper_will_send else None,
+                                clear_buffer=0 if rpc_stream_count == 0 else 1,
+                                interval=args.gripper_interval,
+                                max_distance=args.gripper_max_distance,
+                                min_distance=args.gripper_min_distance,
+                            )
+                        else:
+                            preview_cmd = rpc_formatter.build_subloop1_stream_cmd(
+                                q_cmd,
+                                gripper_mm_for_rpc if gripper_will_send else None,
+                                clear_buffer=0 if rpc_stream_count == 0 else 1,
+                                interval=args.gripper_interval,
+                                max_distance=args.gripper_max_distance,
+                                min_distance=args.gripper_min_distance,
+                            )
                         slot = "first" if rpc_stream_count == 0 else "stream"
                         print(f"[{INFER_LOG_PREFIX}][RPC] dry-run {slot} would send: {preview_cmd}")
                         rpc_stream_count += 1
@@ -418,17 +504,28 @@ def run_inference(args) -> int:
                     gripper_subloop = f"JogAnyJ j1={j1:.4f}m ({gripper_mm_for_rpc:.2f}mm)"
 
             if now - last_print >= args.print_every:
-                if args.gripper_normalized:
-                    action6_str = f"action[6]={gripper_raw:.3f} (norm)"
+                if action_space == "ee_pose":
+                    action7_str = f"action[7]={gripper_raw:.4f}m"
+                    print(
+                        f"[{INFER_LOG_PREFIX}] "
+                        f"xyz={np.round(xyz_current, 4)} "
+                        f"quat_xyzw={np.round(quat_xyzw_current, 4)} "
+                        f"xyz_cmd={np.round(ee_xyz_cmd, 4)} "
+                        f"quat_cmd={np.round(ee_quat_xyzw_cmd, 4)} "
+                        f"{action7_str}"
+                    )
                 else:
-                    action6_str = f"action[6]={gripper_raw:.2f}mm"
-                print(
-                    f"[{INFER_LOG_PREFIX}] "
-                    f"q_cur={np.round(q_current, 3)} "
-                    f"q_tgt={np.round(q_target, 3)} "
-                    f"q_cmd={np.round(q_cmd, 3)} "
-                    f"{action6_str}"
-                )
+                    if args.gripper_normalized:
+                        action6_str = f"action[6]={gripper_raw:.3f} (norm)"
+                    else:
+                        action6_str = f"action[6]={gripper_raw:.2f}mm"
+                    print(
+                        f"[{INFER_LOG_PREFIX}] "
+                        f"q_cur={np.round(q_current, 3)} "
+                        f"q_tgt={np.round(q_target, 3)} "
+                        f"q_cmd={np.round(q_cmd, 3)} "
+                        f"{action6_str}"
+                    )
                 latched_display_mm = (
                     latched_gripper_mm(
                         held_gripper_open,

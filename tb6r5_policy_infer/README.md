@@ -279,6 +279,8 @@ python -m tb6r5_policy_infer.cli --robot-ip 192.168.11.11 --policy-path ... --dr
 
 ### 观测 / 动作约定
 
+默认 `--action-space joints`：
+
 
 | 字段                                 | 形状        | 单位 / 说明                                                |
 | ---------------------------------- | --------- | ------------------------------------------------------ |
@@ -288,6 +290,31 @@ python -m tb6r5_policy_infer.cli --robot-ip 192.168.11.11 --policy-path ... --dr
 
 
 训练时夹爪为 **[0,1] 归一化** 的数据集，加 `--gripper-normalized`（见下文「夹爪单位」）。
+
+`--action-space ee_pose`（pi05 等 TCP 策略）：
+
+
+| 字段                  | 形状 | 单位 / 说明 |
+| ------------------- | -- | -------- |
+| `observation.state` | 8  | `[x,y,z, qx,qy,qz,qw, gripper_m]`；TCP 来自 Topic `robottarget`，夹爪为 **米** |
+| `action`            | 8  | 同上；经 `--ee-step-max-m` 限幅平移后以 **JogAnyC** + 夹爪 RPC 下发 |
+
+
+```bash
+tb6r5-policy-infer \
+  --robot-ip 192.168.11.11 \
+  --policy-path /path/to/pi05/pretrained_model \
+  --action-space ee_pose \
+  --ee-step-max-m 0.03 \
+  --g-model 3 \
+  --cd-version 45 \
+  --task "你的任务文本" \
+  --camera-serials 'realsense_0=135522071053,realsense_1=244222075136' \
+  --camera-width 640 --camera-height 480 --camera-fps 30 \
+  --dry-run
+```
+
+逻辑名须与训练 `observation.images.*` 一致；换物理机只改 `=` 右侧。也可用 `--camera-devices` / `--camera-urls`（优先级 urls > devices > serials）。
 
 ### 安全与生命周期
 

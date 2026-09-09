@@ -25,7 +25,7 @@ DEFAULT_GRIPPER_RPC_RATE_HZ = 2.0
 DEFAULT_TWO_FINGERS_GRIPPER_CMD_DELTA = 0.5
 DEFAULT_REALSENSE_SERIAL_DICT = {
     "realsense_0": "135522071053",
-    "realsense_1": "327122073649",
+    "realsense_1": "244222075136",
 }
 
 # ANSI colors for gripper debug: green=open, red=close.

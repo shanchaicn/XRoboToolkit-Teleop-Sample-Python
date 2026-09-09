@@ -19,6 +19,8 @@ _KNOWN_KEYS = frozenset(
         "policy_type",
         "fps",
         "joint_step_max_rad",
+        "action_space",
+        "ee_step_max_m",
         "joint_vel",
         "joint_acc",
         "joint_dec",

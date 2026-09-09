@@ -204,6 +204,7 @@ class TB6R5Interface:
         self._rpc_sync_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._joint_stream_count = 0
+        self._cartesian_stream_count = 0
         self._gripper_stream_count = 0
         self._jog_async_pending = 0
         self._subloop1_stream_pending = 0
@@ -215,6 +216,11 @@ class TB6R5Interface:
         self._last_gripper_distance_sent: float | None = None
         self._gripper_cmd_delta_mm = DEFAULT_GRIPPER_CMD_DELTA_MM
         self._last_cmd_q: np.ndarray | None = None
+        self._last_cmd_xyz: np.ndarray | None = None
+        self._last_cmd_quat_wxyz: np.ndarray | None = None
+        self.cartesian_vel: float | None = None
+        self.cartesian_acc: float | None = None
+        self.cartesian_dec: float | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -310,10 +316,29 @@ class TB6R5Interface:
             return np.zeros(self.joint_count)
         return self._topic.get_joint_velocities()
 
+    def get_robottarget(self) -> tuple[np.ndarray, np.ndarray, bool]:
+        """TCP pose from Topic: xyz (m), quat_xyzw, healthy.
+
+        Uses vendor ``models_current_points[0].robottarget`` / ``get_current_robottarget``.
+        """
+        if self._topic is None:
+            return np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), False
+        return self._topic.get_robottarget()
+
+    def is_robottarget_healthy(self) -> bool:
+        if self._topic is None:
+            return False
+        return self._topic.is_robottarget_healthy()
+
     def get_gripper_distance_mm(self) -> float | None:
         if self._topic is None:
             return None
         return self._topic.get_gripper_distance_mm()
+
+    def get_gripper_distance_m(self) -> float | None:
+        if self._topic is None:
+            return None
+        return self._topic.get_gripper_distance_m()
 
     def go_home(
         self,
@@ -445,6 +470,93 @@ class TB6R5Interface:
         self._joint_stream_count += 1
         return True
 
+    @staticmethod
+    def quat_xyzw_to_wxyz(quat_xyzw: np.ndarray) -> np.ndarray:
+        q = np.asarray(quat_xyzw, dtype=float).ravel()
+        if len(q) < 4:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        qx, qy, qz, qw = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        return np.array([qw, qx, qy, qz], dtype=float)
+
+    def _format_robottarget_value(self, xyz: np.ndarray, quat_wxyz: np.ndarray) -> str:
+        xyz = np.asarray(xyz, dtype=float).ravel()[:3]
+        quat = np.asarray(quat_wxyz, dtype=float).ravel()
+        if len(quat) < 4:
+            quat = np.array([1.0, 0.0, 0.0, 0.0])
+        qw, qx, qy, qz = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+        return "{" + ",".join(f"{v:.6f}" for v in (xyz[0], xyz[1], xyz[2], qx, qy, qz, qw)) + "}"
+
+    def _format_jog_any_c_cmd(
+        self,
+        xyz: np.ndarray,
+        quat_wxyz: np.ndarray,
+        clear_buffer: int = 0,
+        zone_ratio: float | None = None,
+        last_count: int = DEFAULT_JOG_ANY_J_LAST_COUNT,
+    ) -> str:
+        val_str = self._format_robottarget_value(xyz, quat_wxyz)
+        cmd = (
+            "{JogAnyC --robottarget_value="
+            + val_str
+            + self._jog_any_j_zone_clear_suffix(clear_buffer, zone_ratio)
+            + f" --last_count={int(last_count)}"
+        )
+        if self.cartesian_vel is not None:
+            cmd += f" --cartesian_vel={float(self.cartesian_vel):.4f}"
+        if self.cartesian_acc is not None:
+            cmd += f" --cartesian_acc={float(self.cartesian_acc):.4f}"
+        if self.cartesian_dec is not None:
+            cmd += f" --cartesian_dec={float(self.cartesian_dec):.4f}"
+        return cmd + "}"
+
+    def set_cartesian_target_with_gripper(
+        self,
+        xyz: np.ndarray,
+        quat_xyzw: np.ndarray,
+        gripper_distance: float,
+        force: bool = False,
+        clear_buffer: int | None = None,
+        interval: float | None = None,
+        max_distance: float | None = None,
+        min_distance: float | None = None,
+        cmd_delta: float | None = None,
+    ) -> bool:
+        """Send JogAnyC + gripper. ``quat_xyzw`` is policy order; RPC uses {x,y,z,qx,qy,qz,qw}."""
+        if not self._ensure_command_channel():
+            return False
+
+        xyz_cmd = np.asarray(xyz, dtype=float).ravel()[:3].copy()
+        quat_wxyz = self.quat_xyzw_to_wxyz(quat_xyzw)
+        gripper_distance = self._clamp_gripper_distance(gripper_distance, max_distance, min_distance)
+        gripper_changed = self._should_send_gripper(
+            gripper_distance,
+            force=force,
+            cmd_delta=cmd_delta,
+            max_distance=max_distance,
+            min_distance=min_distance,
+        )
+
+        clear_buffer = self._resolve_stream_clear_buffer(self._cartesian_stream_count, clear_buffer)
+        arm_inner = self._strip_cmd_braces(self._format_jog_any_c_cmd(xyz_cmd, quat_wxyz, clear_buffer=clear_buffer))
+        grip_arg = gripper_distance if gripper_changed else None
+        grip_clear = None
+        if grip_arg is not None and self.g_model == 3:
+            grip_clear = 0 if self._gripper_stream_count == 0 else 1
+        ok = self._send_subloop1(
+            arm_inner,
+            grip_arg,
+            interval=interval,
+            max_distance=max_distance,
+            min_distance=min_distance,
+            gripper_clear_buffer=grip_clear,
+        )
+        if not ok:
+            return False
+        self._last_cmd_xyz = xyz_cmd
+        self._last_cmd_quat_wxyz = quat_wxyz
+        self._cartesian_stream_count += 1
+        return True
+
     def build_subloop1_stream_cmd(
         self,
         q: np.ndarray,
@@ -466,6 +578,42 @@ class TB6R5Interface:
             interval = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL
         q_cmd = np.asarray(q, dtype=float).ravel()[: self.joint_count]
         arm_inner = self._strip_cmd_braces(self._format_jog_any_j_cmd(q_cmd, clear_buffer=int(clear_buffer)))
+        if gripper_distance is None:
+            grip_inner = NOT_RUN_EXECUTE
+        else:
+            grip_clear = 0 if clear_buffer == 0 else 1
+            grip_inner = self._format_gripper_inner(
+                gripper_distance,
+                interval,
+                max_distance,
+                min_distance,
+                clear_buffer=grip_clear,
+            )
+        if not self.use_subloop1:
+            return self.format_dual_model_cmd(arm_inner, grip_inner)
+        return self.format_subloop1_exec_cmd(arm_inner, grip_inner, immediate=immediate)
+
+    def build_cartesian_stream_cmd(
+        self,
+        xyz: np.ndarray,
+        quat_xyzw: np.ndarray,
+        gripper_distance: float | None,
+        clear_buffer: int,
+        interval: float | None = None,
+        max_distance: float | None = None,
+        min_distance: float | None = None,
+        immediate: bool | None = None,
+    ) -> str:
+        """Build JogAnyC (+ gripper) command string without sending (dry-run / --print-rpc)."""
+        if immediate is None:
+            immediate = self.subloop1_immediate
+        if interval is None:
+            interval = DEFAULT_TWO_FINGERS_GRIPPER_INTERVAL
+        xyz_cmd = np.asarray(xyz, dtype=float).ravel()[:3]
+        quat_wxyz = self.quat_xyzw_to_wxyz(quat_xyzw)
+        arm_inner = self._strip_cmd_braces(
+            self._format_jog_any_c_cmd(xyz_cmd, quat_wxyz, clear_buffer=int(clear_buffer))
+        )
         if gripper_distance is None:
             grip_inner = NOT_RUN_EXECUTE
         else:
@@ -843,6 +991,7 @@ class TB6R5Interface:
             self._subloop1_session_gen += 1
         # Next SubLoop1 session should start with clear_buffer=0 for arm/gripper streams.
         self._joint_stream_count = 0
+        self._cartesian_stream_count = 0
         self._gripper_stream_count = 0
 
     def send_subloop1_exit(self, timeout_ms: int = DEFAULT_SUBLOOP1_EXIT_TIMEOUT_MS, blocking: bool = False) -> bool:

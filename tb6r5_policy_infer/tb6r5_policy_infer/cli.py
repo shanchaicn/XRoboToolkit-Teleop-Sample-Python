@@ -111,6 +111,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--joint-step-max-rad", type=float, default=0.03, help="Per-step joint delta clamp (rad)")
     parser.add_argument(
+        "--action-space",
+        default="joints",
+        choices=("joints", "ee_pose"),
+        help=(
+            "Policy state/action layout. "
+            "'joints': 7D [j0..j5, gripper_mm] + JogAnyJ (default). "
+            "'ee_pose': 8D [x,y,z,qx,qy,qz,qw,gripper_m] from Topic robottarget + JogAnyC."
+        ),
+    )
+    parser.add_argument(
+        "--ee-step-max-m",
+        type=float,
+        default=0.03,
+        help="Per-step TCP translation clamp in meters (ee_pose only; <=0 disables)",
+    )
+    parser.add_argument(
         "--joint-vel",
         type=float,
         default=DEFAULT_JOG_ANY_JOINT_VEL,
