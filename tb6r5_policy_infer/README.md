@@ -2,6 +2,8 @@
 
 独立于 `xrobotoolkit_teleop` 遥操作框架的 TB6-R5 **LeRobot 策略推理与离线评估**包。
 
+本目录同步自 [shanchaicn/tb6r5_policy_infer](https://github.com/shanchaicn/tb6r5_policy_infer) `2f3fac2`（2026-09-17）。
+
 支持 LeRobot 训练的 **ACT**、**Diffusion**、**SmolVLA**、**pi0 / pi0.5 (pi05) / pi0-FAST** 等策略（由 checkpoint 内 `config.json` 的 `type` 字段自动识别）。不同策略会自动套用各自的真机部署默认（控制频率、RPC 频率、动作队列处理、语言任务需求），参数取值参考 LeRobot 各策略配置。
 
 **真机推理数据接口（观测/动作/相机/RPC）**：[docs/ACT_Policy_Infer_Interface.md](../docs/ACT_Policy_Infer_Interface.md)
@@ -158,9 +160,36 @@ conda activate /home/ai/condaenv/tb6r5
 pip install -e "./tb6r5_policy_infer[hardware]" --no-deps
 # 若依赖有变再补装；最后确认 CUDA 仍可用
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# HTTP 启停推理（可选）：只补 fastapi/uvicorn，勿再 pip install torch
+pip install "fastapi>=0.100" "uvicorn>=0.20"
 ```
 
 模型权重（`pretrained_model/`）需单独 `rsync`，不在 git 里。
+
+### HTTP 推理控制面（`tb6r5-infer-api`）
+
+不 import lerobot/torch，只在本环境拉起 `tb6r5-policy-infer --config configs/act.yaml`。Jetson 上 **不要** `pip install -e "./tb6r5_policy_infer[api]"` 而不加 `--no-deps`（会误装 PyPI torch）。
+
+```bash
+conda activate /home/ai/condaenv/tb6r5
+cd <仓库根>   # 本遥操作仓库根；独立 policy_infer 仓库则把路径改成 ".[hardware,api]"
+pip install -e "./tb6r5_policy_infer[hardware,api]" --no-deps
+pip install "fastapi>=0.100" "uvicorn>=0.20"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  # 须仍为 True
+
+tb6r5-infer-api --host 0.0.0.0 --port 8005
+# 或: python tb6r5_policy_infer/infer_api.py --port 8005
+```
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/inference/start` | 启动推理（已在跑则 409） |
+| POST | `/inference/stop` | SIGINT 停进程 |
+| GET | `/inference/status` | pid / returncode |
+| GET | `/inference/logs?lines=200` | 尾部日志 |
+| GET | `/health` | 探活 |
+
+环境变量：`TB6R5_INFER_COMMAND`、`TB6R5_INFER_CONFIG`（默认 `configs/act.yaml`）、`TB6R5_INFER_LOG`。
 
 ---
 
@@ -300,12 +329,17 @@ python -m tb6r5_policy_infer.cli --robot-ip 192.168.11.11 --policy-path ... --dr
 | `action`            | 8  | 同上；经 `--ee-step-max-m` 限幅平移后以 **JogAnyC** + 夹爪 RPC 下发 |
 
 
+TCP 还可设笛卡尔工作空间盒（机器人基座 / JogAnyC 坐标系，单位米）：`--ee-xyz-min` / `--ee-xyz-max`。越界时 `--ee-limit-mode clamp`（默认）裁剪后下发，`abort` 则跳过本次 JogAnyC 并停止。YAML 示例见 `configs/infer_example.yaml`。
+
 ```bash
 tb6r5-policy-infer \
   --robot-ip 192.168.11.11 \
   --policy-path /path/to/pi05/pretrained_model \
   --action-space ee_pose \
   --ee-step-max-m 0.03 \
+  --ee-xyz-min 0.00 0.20 0.10 \
+  --ee-xyz-max 0.50 0.80 0.70 \
+  --ee-limit-mode abort \
   --g-model 3 \
   --cd-version 45 \
   --task "你的任务文本" \
@@ -325,6 +359,8 @@ tb6r5-policy-infer \
 | `--print-rpc`                              | 关        | 每次发送打印完整 SubLoop1 / JogAnyJ 指令（dry-run 打印「本应发送」）；不受 `--print-every` 限流 |
 | `--fps`                                    | 按策略      | 控制循环频率；默认按策略类型自动选择（见上表），显式传值覆盖 |
 | `--joint-step-max-rad`                     | 0.03     | 策略输出限幅：每步最大关节变化（rad）           |
+| `--ee-xyz-min` / `--ee-xyz-max`            | 无        | `ee_pose` 笛卡尔工作空间盒（米）；省略则不限制     |
+| `--ee-limit-mode`                          | clamp    | 越界：`clamp` 裁剪后下发；`abort` 跳过并停止      |
 | `--home-joint-deg`                         | 遥操作 home | 复位目标关节角（度）×6                  |
 | `--home-settle-time`                       | 3 s      | 复位后等待                          |
 | `--no-home-on-start`                       | 关        | 跳过**启动**复位                     |
@@ -741,6 +777,7 @@ pip install "transformers>=4.57.1,<5.0.0" "huggingface-hub>=0.34.2,<0.36.0"
 | `hardware/`      | 内置 TB6-R5 RPC/Topic（`tb6r5.py`）与 RealSense（不依赖 `xrobotoolkit_teleop`） |
 | `vendor/` / `vendor_py312/` | 厂商 `rpc.so` / `topic.so`（按 Python 3.10 / 3.12 选用） |
 | `lerobot_compat` | LeRobot 版本兼容与 config 加载                                      |
+| `infer_api`      | HTTP 启停 `tb6r5-policy-infer`（入口 `tb6r5-infer-api`，不依赖 torch） |
 
 
 真机部署只需更新本推理包；SDK 已内置在 `tb6r5_policy_infer/vendor*`（也可用 `TB6R5_DEPS_ROOT` 覆盖）。

@@ -326,8 +326,10 @@ tb6r5-policy-infer \
 | `--gripper-normalized` | 暂无 | 支持 |
 | LeRobot 导入 | 直接 `lerobot.policies.factory` | `lerobot_compat`（兼容 0.4/0.5、Groot stub） |
 | `--help` 不装主包 | 需完整依赖 | 支持（真机运行仍需主包） |
+| HTTP 启停 | 无 | `tb6r5-infer-api`（`infer_api.py`，不 import torch） |
+| `ee_pose` 工作空间盒 | 无 | `--ee-xyz-min/max`、`--ee-limit-mode` |
 
-新功能优先在 `tb6r5_policy_infer` 维护；脚本保持单文件可运行副本。
+新功能优先在 `tb6r5_policy_infer` 维护（同步自 [shanchaicn/tb6r5_policy_infer](https://github.com/shanchaicn/tb6r5_policy_infer)）；脚本保持单文件可运行副本。
 
 ---
 
@@ -339,4 +341,5 @@ tb6r5-policy-infer \
 | [tb6r5_policy_infer/README.md](../tb6r5_policy_infer/README.md) | 安装、TER30、依赖版本 |
 | `scripts/hardware/policy_infer_tb6r5_act.py` | 脚本实现与简短 `--help` |
 | `tb6r5_policy_infer/tb6r5_policy_infer/runner.py` | 打包版控制循环 |
+| `tb6r5_policy_infer/tb6r5_policy_infer/infer_api.py` | HTTP 启停推理（`tb6r5-infer-api`） |
 | `xrobotoolkit_teleop/hardware/interface/tb6r5.py` | RPC / SubLoop1 实现 |
